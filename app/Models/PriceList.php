@@ -3,6 +3,7 @@
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasMany;
 
 class PriceList extends Model
 {
@@ -19,4 +20,13 @@ class PriceList extends Model
     protected $casts = [
         'processed_at' => 'datetime',
     ];
+
+    public function rows(): HasMany
+    {
+        return $this->hasMany(PriceListRow::class);
+    }
+    public function logs(): HasMany
+    {
+        return $this->hasMany(PriceListLog::class);
+    }
 }
