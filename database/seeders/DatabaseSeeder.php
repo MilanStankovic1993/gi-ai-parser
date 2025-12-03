@@ -17,6 +17,7 @@ class DatabaseSeeder extends Seeder
     {
         $this->call([
             AdminUserSeeder::class,
+            DemoAiTravelDataSeeder::class,
         ]);
         // User::factory(10)->create();
 
