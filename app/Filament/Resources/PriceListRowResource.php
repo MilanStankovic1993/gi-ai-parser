@@ -23,6 +23,10 @@ use App\Models\PriceList;
 
 class PriceListRowResource extends Resource
 {
+    public static function shouldRegisterNavigation(): bool
+    {
+        return false;
+    }
     protected static ?string $model = PriceListRow::class;
 
     protected static ?string $navigationIcon = 'heroicon-o-rectangle-stack';

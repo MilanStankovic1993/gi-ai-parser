@@ -20,6 +20,10 @@ use App\Models\PriceList;
 
 class PriceListLogResource extends Resource
 {
+    public static function shouldRegisterNavigation(): bool
+    {
+        return false;
+    }
     protected static ?string $model = PriceListLog::class;
 
     protected static ?string $navigationIcon = 'heroicon-o-rectangle-stack';

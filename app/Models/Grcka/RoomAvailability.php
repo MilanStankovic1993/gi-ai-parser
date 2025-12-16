@@ -7,11 +7,17 @@ use Illuminate\Database\Eloquent\Model;
 class RoomAvailability extends Model
 {
     protected $connection = 'grcka';
-    protected $table = 'pt_rooms_availabilities';
-    protected $primaryKey = 'rva_id';
-    public $timestamps = false;
+    protected $table      = 'pt_rooms_availabilities';
+    protected $primaryKey = 'id';
+    public    $timestamps = false;
 
     protected $guarded = [];
+
+    protected $casts = [
+        'room_id' => 'integer',
+        'y'       => 'integer',
+        'm'       => 'integer',
+    ];
 
     public function room()
     {

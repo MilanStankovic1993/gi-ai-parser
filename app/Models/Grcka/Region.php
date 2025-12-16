@@ -7,9 +7,9 @@ use Illuminate\Database\Eloquent\Model;
 class Region extends Model
 {
     protected $connection = 'grcka';
-    protected $table = 'pt_regions';
+    protected $table      = 'pt_regions';
     protected $primaryKey = 'region_id';
-    public $timestamps = false;
+    public    $timestamps = false;
 
     protected $guarded = [];
 

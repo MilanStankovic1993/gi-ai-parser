@@ -22,6 +22,10 @@ use Filament\Tables\Columns\IconColumn;
 
 class PriceListResource extends Resource
 {
+    public static function shouldRegisterNavigation(): bool
+    {
+        return false;
+    }
     protected static ?string $model = PriceList::class;
 
     protected static ?string $navigationIcon = 'heroicon-o-rectangle-stack';

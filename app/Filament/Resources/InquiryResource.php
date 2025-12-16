@@ -19,111 +19,81 @@ class InquiryResource extends Resource
 
     public static function form(Form $form): Form
     {
-        return $form
-            ->schema([
-                \Filament\Forms\Components\Section::make('Guest')
-                    ->schema([
-                        \Filament\Forms\Components\TextInput::make('guest_name')
-                            ->label('Ime gosta')
-                            ->maxLength(255),
+        return $form->schema([
+            \Filament\Forms\Components\Section::make('Guest')
+                ->schema([
+                    \Filament\Forms\Components\TextInput::make('guest_name')->label('Ime gosta')->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('guest_email')->label('Email')->email()->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('guest_phone')->label('Telefon')->maxLength(255),
+                ])
+                ->columns(3),
 
-                        \Filament\Forms\Components\TextInput::make('guest_email')
-                            ->label('Email')
-                            ->email()
-                            ->maxLength(255),
+            \Filament\Forms\Components\Section::make('Inquiry')
+                ->schema([
+                    \Filament\Forms\Components\TextInput::make('subject')->label('Naslov / subject')->maxLength(255),
 
-                        \Filament\Forms\Components\TextInput::make('guest_phone')
-                            ->label('Telefon')
-                            ->maxLength(255),
-                    ])
-                    ->columns(3),
+                    \Filament\Forms\Components\Textarea::make('raw_message')
+                        ->label('Originalni upit')
+                        ->rows(8)
+                        ->required(),
 
-                \Filament\Forms\Components\Section::make('Inquiry')
-                    ->schema([
-                        \Filament\Forms\Components\TextInput::make('subject')
-                            ->label('Naslov / subject')
-                            ->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('region')->label('Regija')->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('location')->label('Mesto')->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('month_hint')->label('Okvirni period')->maxLength(255),
 
-                        \Filament\Forms\Components\Textarea::make('raw_message')
-                            ->label('Originalni upit')
-                            ->rows(8)
-                            ->required(),
+                    \Filament\Forms\Components\DatePicker::make('date_from')->label('Datum od'),
+                    \Filament\Forms\Components\DatePicker::make('date_to')->label('Datum do'),
 
-                        \Filament\Forms\Components\TextInput::make('region')
-                            ->label('Regija')
-                            ->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('adults')->label('Odrasli')->numeric()->minValue(0),
 
-                        \Filament\Forms\Components\DatePicker::make('date_from')
-                            ->label('Datum od'),
+                    \Filament\Forms\Components\TextInput::make('children')->label('Deca')->numeric()->minValue(0),
 
-                        \Filament\Forms\Components\DatePicker::make('date_to')
-                            ->label('Datum do'),
+                    \Filament\Forms\Components\TextInput::make('children_ages')
+                        ->label('Uzrast dece (npr: 5 ili 5, 8)')
+                        ->maxLength(255),
 
-                        \Filament\Forms\Components\TextInput::make('adults')
-                            ->label('Odrasli')
-                            ->numeric()
-                            ->minValue(0),
+                    \Filament\Forms\Components\TextInput::make('budget_min')->label('Budžet min')->numeric()->minValue(0),
+                    \Filament\Forms\Components\TextInput::make('budget_max')->label('Budžet max')->numeric()->minValue(0),
 
-                        \Filament\Forms\Components\TextInput::make('children')
-                            ->label('Deca')
-                            ->numeric()
-                            ->minValue(0),
+                    \Filament\Forms\Components\DateTimePicker::make('received_at')
+                        ->label('Primljeno')
+                        ->default(now()),
+                ])
+                ->columns(2),
 
-                        \Filament\Forms\Components\TextInput::make('budget_min')
-                            ->label('Budžet min')
-                            ->numeric()
-                            ->minValue(0),
+            \Filament\Forms\Components\Section::make('Workflow / obrada')
+                ->schema([
+                    \Filament\Forms\Components\Select::make('reply_mode')
+                        ->label('Način odgovora')
+                        ->options([
+                            'ai_draft' => 'AI draft',
+                            'manual'   => 'Ručni',
+                        ])
+                        ->default('ai_draft')
+                        ->required(),
 
-                        \Filament\Forms\Components\TextInput::make('budget_max')
-                            ->label('Budžet max')
-                            ->numeric()
-                            ->minValue(0),
+                    \Filament\Forms\Components\Select::make('status')
+                        ->label('Status upita')
+                        ->options([
+                            'new'       => 'New',
+                            'extracted' => 'Extracted',
+                            'suggested' => 'Suggested',
+                            'replied'   => 'Replied',
+                            'closed'    => 'Closed',
+                        ])
+                        ->default('new'),
 
-                        \Filament\Forms\Components\DateTimePicker::make('received_at')
-                            ->label('Primljeno')
-                            ->default(now()),
-                    ])
-                    ->columns(2),
-
-                // 🔹 NOVO: Workflow sekcija
-                \Filament\Forms\Components\Section::make('Workflow / obrada')
-                    ->schema([
-                        \Filament\Forms\Components\Select::make('reply_mode')
-                            ->label('Način odgovora')
-                            ->options([
-                                'ai_draft' => 'AI draft (pripremi automatski predlog mejla)',
-                                'manual'   => 'Ručni odgovor (bez AI drafa)',
-                            ])
-                            ->default('ai_draft')
-                            ->required()
-                            ->helperText('Ovim birate da li će operater koristiti AI draft kao osnovu, ili će ceo odgovor pisati ručno.'),
-
-                        \Filament\Forms\Components\Select::make('status')
-                            ->label('Status upita')
-                            ->options([
-                                'new'       => 'New',
-                                'extracted' => 'Extracted',
-                                'suggested' => 'Suggested',
-                                'replied'   => 'Replied',
-                                'closed'    => 'Closed',
-                            ])
-                            ->default('new'),
-
-                        \Filament\Forms\Components\Toggle::make('is_priority')
-                            ->label('Prioritetan upit')
-                            ->helperText('Za hitne ili bitne goste.'),
-                    ])
-                    ->columns(3),
-            ]);
+                    \Filament\Forms\Components\Toggle::make('is_priority')->label('Prioritetan upit'),
+                ])
+                ->columns(3),
+        ]);
     }
 
     public static function table(Table $table): Table
     {
         return $table
             ->columns([
-                Tables\Columns\TextColumn::make('id')
-                    ->label('ID')
-                    ->sortable(),
+                Tables\Columns\TextColumn::make('id')->label('ID')->sortable(),
 
                 Tables\Columns\TextColumn::make('received_at')
                     ->label('Primljeno')
@@ -137,7 +107,6 @@ class InquiryResource extends Resource
                         if ($record->guest_email) {
                             return trim(($record->guest_name ?: 'N/A') . ' <' . $record->guest_email . '>');
                         }
-
                         return $record->guest_name ?: 'N/A';
                     })
                     ->searchable(),
@@ -148,10 +117,7 @@ class InquiryResource extends Resource
                     ->tooltip(fn (Inquiry $record) => $record->raw_message)
                     ->searchable(),
 
-                Tables\Columns\TextColumn::make('region')
-                    ->label('Regija')
-                    ->sortable()
-                    ->toggleable(),
+                Tables\Columns\TextColumn::make('region')->label('Regija')->sortable()->toggleable(),
 
                 Tables\Columns\BadgeColumn::make('status')
                     ->label('Status')
@@ -184,6 +150,7 @@ class InquiryResource extends Resource
                 Tables\Filters\Filter::make('open_only')
                     ->label('Samo nerešeni')
                     ->query(fn ($query) => $query->whereNotIn('status', ['replied', 'closed'])),
+
                 Tables\Filters\SelectFilter::make('status')
                     ->label('Status')
                     ->options([
@@ -206,14 +173,10 @@ class InquiryResource extends Resource
                     ]),
             ])
             ->actions([
-                Tables\Actions\ViewAction::make()
-                    ->label('Open')
-                    ->icon('heroicon-o-eye'),
+                Tables\Actions\ViewAction::make()->label('Open')->icon('heroicon-o-eye'),
             ])
             ->bulkActions([
-                Tables\Actions\BulkActionGroup::make([
-                    // kasnije: mark as priority, change reply mode, itd.
-                ]),
+                Tables\Actions\BulkActionGroup::make([]),
             ]);
     }
 

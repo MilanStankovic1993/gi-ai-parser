@@ -15,6 +15,10 @@ use App\Jobs\ProcessPriceList;
 
 class UploadPriceList extends Page implements HasForms
 {
+    public static function shouldRegisterNavigation(): bool
+    {
+        return false;
+    }
     use InteractsWithForms;
 
     protected static ?string $navigationLabel = 'Upload cenovnika';

@@ -14,6 +14,10 @@ use Filament\Forms\Components\Tabs\Tab;
 
 class AccommodationResource extends Resource
 {
+    public static function shouldRegisterNavigation(): bool
+    {
+        return false;
+    }
     protected static ?string $model = Accommodation::class;
 
     protected static ?string $navigationIcon = 'heroicon-o-building-office';

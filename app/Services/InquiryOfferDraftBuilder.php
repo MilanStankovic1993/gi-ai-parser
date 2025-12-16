@@ -9,132 +9,122 @@ class InquiryOfferDraftBuilder
 {
     public function build(Inquiry $inquiry, Collection $candidates): string
     {
+        $guest = $inquiry->guest_name ?: 'Poštovani';
+
+        $period = $this->formatPeriod($inquiry);
+        $pax = $this->formatPax($inquiry);
+
         $lines = [];
 
-        // Uvod – personalizovan ako imamo ime
-        $guestName = $inquiry->guest_name ?: 'Poštovani';
+        $lines[] = "Poštovani,";
+        $lines[] = "";
+        $lines[] = "Hvala vam na javljanju i interesovanju za letovanje u Grčkoj.";
+        $lines[] = "";
+        $lines[] = "Na osnovu informacija iz vašeg upita, u nastavku vam šaljemo nekoliko predloga smeštaja koji bi mogli da odgovaraju vašim željama. Ukoliko smo nešto pogrešno razumeli ili želite izmene, slobodno nas ispravite.";
+        $lines[] = "";
 
-        $lines[] = "{$guestName},";
-        $lines[] = '';
-        $lines[] = 'hvala Vam na upitu i interesovanju za smeštaj. Na osnovu Vaših kriterijuma pripremili smo nekoliko predloga koji najbolje odgovaraju traženim terminima i budžetu.';
-        $lines[] = '';
-
-        // Osnovni rezime upita (region, datumi, ljudi, budžet)
-        $summaryParts = [];
-
-        if ($inquiry->region) {
-            $summaryParts[] = "lokacija: {$inquiry->region}";
+        // (opciono) kratki rezime - ako hoćeš da ga imaš uvek
+        if ($period || $pax) {
+            $summary = [];
+            if ($period) $summary[] = "Period: {$period}";
+            if ($pax) $summary[] = "Osobe: {$pax}";
+            $lines[] = implode(" • ", $summary);
+            $lines[] = "";
         }
 
-        if ($inquiry->date_from && $inquiry->date_to) {
-            $summaryParts[] = sprintf(
-                'termin: %s – %s',
-                $inquiry->date_from->format('d.m.Y'),
-                $inquiry->date_to->format('d.m.Y'),
-            );
-        }
+        $top = $candidates->take(5)->values();
 
-        $people = [];
-        if ($inquiry->adults) {
-            $people[] = "{$inquiry->adults} odraslih";
-        }
-        if ($inquiry->children) {
-            $people[] = "{$inquiry->children} dece";
-        }
-        if (! empty($people)) {
-            $summaryParts[] = 'broj osoba: ' . implode(' + ', $people);
-        }
+        foreach ($top as $idx => $c) {
+            $n = $idx + 1;
 
-        if ($inquiry->budget_max) {
-            $summaryParts[] = "budžet: do {$inquiry->budget_max} €";
-        }
+            $name = data_get($c, 'name') ?? data_get($c, 'title') ?? 'Smeštaj';
+            $location = data_get($c, 'location') ?? data_get($c, 'place') ?? $inquiry->location ?? null;
 
-        if (! empty($summaryParts)) {
-            $lines[] = 'Sažetak Vašeg upita:';
-            $lines[] = '- ' . implode(' | ', $summaryParts);
-            $lines[] = '';
-        }
+            $type = data_get($c, 'type') ?? data_get($c, 'unit_type') ?? null;
+            $capacity = data_get($c, 'capacity') ?? data_get($c, 'max_persons') ?? null;
 
-        $lines[] = 'Na osnovu toga, predlažemo sledeće opcije:';
-        $lines[] = '';
+            // cena: pokušaj total za period; fallback na bilo koji price
+            $priceTotal = data_get($c, 'price_total') ?? data_get($c, 'total_price') ?? data_get($c, 'price') ?? null;
+            $priceText = $priceTotal ? $this->money($priceTotal) : null;
 
-        // Svaki kandidat → jedna “ponuda”
-        foreach ($candidates as $index => $item) {
-            $acc = $item['accommodation'];
+            $nights = $inquiry->nights ?: data_get($c, 'nights');
+            $beach = data_get($c, 'beach_distance') ?? data_get($c, 'distance_to_beach') ?? null;
+            $beachText = $beach ? $this->formatBeach($beach) : null;
 
-            $number = $index + 1;
-
-            $title = "{$number}. {$acc->name}, {$acc->settlement}, {$acc->region}";
-
-            $lines[] = $title;
-            $lines[] = str_repeat('-', mb_strlen($title));
-
-            $lines[] = sprintf(
-                'Tip smeštaja: %s (maksimalno %d osoba)',
-                $acc->unit_type,
-                $acc->max_persons,
-            );
-
-            if (! empty($item['total_price']) && ! empty($item['price_per_night'])) {
-                $lines[] = sprintf(
-                    'Cena za ceo traženi period: %d € (oko %d € po noći)',
-                    $item['total_price'],
-                    $item['price_per_night'],
-                );
+            $url = data_get($c, 'url') ?? data_get($c, 'link') ?? data_get($c, 'website_url') ?? null;
+            if ($url && ! str_starts_with($url, 'http')) {
+                $url = 'https://' . ltrim($url, '/');
             }
 
-            if ($acc->distance_to_beach !== null) {
-                $beachLabel = $this->formatBeachType($acc->beach_type);
-                $lines[] = sprintf(
-                    'Udaljenost do plaže: %d m (%s)',
-                    $acc->distance_to_beach,
-                    $beachLabel,
-                );
+            $title = $name . ($location ? " – {$location}" : "");
+            $lines[] = "{$n}. {$title}";
+
+            $bits = [];
+            if ($type) $bits[] = "Tip: {$type}";
+            if ($capacity) $bits[] = "Kapacitet: do {$capacity} osobe";
+            if ($priceText && $nights) $bits[] = "Cena: {$priceText} za {$nights} noćenja";
+            elseif ($priceText) $bits[] = "Cena: {$priceText}";
+            if ($beachText) $bits[] = "Plaža: {$beachText}";
+
+            if (! empty($bits)) {
+                $lines[] = "• " . implode(" • ", $bits);
             }
 
-            $lines[] = 'Parking: ' . ($acc->has_parking ? 'dostupan' : 'nije dostupan');
-            $lines[] = 'Primaju ljubimce: ' . ($acc->accepts_pets ? 'da' : 'ne');
-
-            if ($acc->noise_level) {
-                $lines[] = 'Lokacija (buka): ' . $this->formatNoiseLevel($acc->noise_level);
+            if ($url) {
+                $lines[] = "• Link: {$url}";
             }
 
-            // Napomena – prednosti / ograničenja
-            if ($acc->availability_note) {
-                $lines[] = 'Napomena: ' . $acc->availability_note;
-            }
-
-            $lines[] = ''; // razmak između ponuda
+            $lines[] = "";
         }
 
-        $lines[] = 'Sve navedene cene su okvirne i zavise od trenutne dostupnosti u momentu rezervacije.';
-        $lines[] = '';
-        $lines[] = 'Ukoliko Vam se neka od opcija dopada, pošaljite nam redni broj ponude ili naziv smeštaja, pa ćemo proveriti tačnu dostupnost i poslati Vam finalnu ponudu sa svim detaljima.';
-        $lines[] = '';
-        $lines[] = 'Srdačan pozdrav,';
-        $lines[] = 'Vaš tim za rezervacije';
+        $lines[] = "Ukoliko vam se neki od predloga dopada, javite nam koji vam je najzanimljiviji kako bismo proverili dostupnost i poslali dalje informacije.";
+        $lines[] = "Ako vam je potrebna druga lokacija, drugačiji period ili dodatne opcije, slobodno nam pišite.";
+        $lines[] = "";
+        $lines[] = "Srdačan pozdrav,";
+        $lines[] = "GrckaInfo tim";
+        $lines[] = "https://grckainfo.com";
 
+        // Filament markdown TextEntry voli plain text sa \n
         return implode("\n", $lines);
     }
 
-    protected function formatBeachType(?string $type): string
+    private function formatPeriod(Inquiry $i): ?string
     {
-        return match ($type) {
-            'sand'   => 'peščana plaža',
-            'pebble' => 'šljunkovita plaža',
-            'mixed'  => 'mešana (pesak/šljunak)',
-            'rocky'  => 'stenovita plaža',
-            default  => 'plaža',
-        };
+        if ($i->date_from && $i->date_to) {
+            return $i->date_from->format('d.m.Y') . " – " . $i->date_to->format('d.m.Y');
+        }
+
+        if ($i->month_hint) {
+            return $i->month_hint;
+        }
+
+        return null;
     }
 
-    protected function formatNoiseLevel(?string $noise): string
+    private function formatPax(Inquiry $i): ?string
     {
-        return match ($noise) {
-            'quiet'     => 'mirna lokacija',
-            'street'    => 'ulica sa umerenim saobraćajem',
-            'main_road' => 'blizina magistrale (može biti više buke)',
-            default     => 'standardna lokacija',
-        };
+        $parts = [];
+        if ($i->adults) $parts[] = $i->adults . " odraslih";
+        if (is_int($i->children) && $i->children > 0) $parts[] = $i->children . " dece";
+
+        if (empty($parts)) return null;
+
+        return implode(", ", $parts);
+    }
+
+    private function money($value): string
+    {
+        $n = (int) preg_replace('/\D+/', '', (string) $value);
+        return number_format($n, 0, ',', '.') . " €";
+    }
+
+    private function formatBeach($distance): string
+    {
+        if (is_numeric($distance)) {
+            $d = (int) $distance;
+            return $d >= 1000 ? round($d / 1000, 1) . " km" : $d . " m";
+        }
+
+        return (string) $distance;
     }
 }
