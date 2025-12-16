@@ -16,7 +16,6 @@ class GiImapPullInquiries extends Command
     {
         $limit = (int) $this->option('limit');
 
-        // Dva inboxa (booking + info)
         $inboxes = [
             'booking' => [
                 'username' => env('IMAP_BOOKING_USERNAME'),
@@ -32,7 +31,7 @@ class GiImapPullInquiries extends Command
             $this->line("== Inbox: {$key} ==");
 
             if (empty(env('IMAP_HOST'))) {
-                $this->error('IMAP_HOST is empty in .env (set host when you get it from client).');
+                $this->error('IMAP_HOST is empty in .env.');
                 continue;
             }
 
@@ -72,62 +71,70 @@ class GiImapPullInquiries extends Command
 
         $folder = $client->getFolder('INBOX');
 
-        // Samo nepročitani, limitirano (da cron ne “pojede” previše odjednom)
         $messages = $folder->query()
             ->unseen()
             ->limit($limit)
             ->get();
 
         $count = 0;
+
         foreach ($messages as $message) {
             $subject = (string) ($message->getSubject() ?? '');
+
             $from = $message->getFrom();
             $fromEmail = (string) (($from[0]->mail ?? '') ?: '');
 
-            // headers
             $headers = $message->getHeader();
-            $messageId = (string) (($headers->get('message-id')[0] ?? '') ?: '');
-            $inReplyTo = (string) (($headers->get('in-reply-to')[0] ?? '') ?: '');
+            $messageId  = (string) (($headers->get('message-id')[0] ?? '') ?: '');
+            $inReplyTo  = (string) (($headers->get('in-reply-to')[0] ?? '') ?: '');
             $references = (string) (($headers->get('references')[0] ?? '') ?: '');
 
-            // 1) Ignoriši follow-up / reply / fwd
+            // 1) Ignoriši follow-up (reply/forward)
             if (!empty($inReplyTo) || !empty($references) || preg_match('/^(re:|fw:|fwd:)/i', trim($subject))) {
                 $message->setFlag('Seen');
                 continue;
             }
 
-            // 2) Ignoriši “Request from …” šablone / sistemske template (po dogovoru)
+            // 2) Ignoriši sistemske “Request from …” (po dogovoru)
             if (Str::contains(Str::lower($subject), 'request from')) {
                 $message->setFlag('Seen');
                 continue;
             }
 
-            // 3) Anti-duplicate preko message-id (external_id)
+            // 3) Anti-duplicate (message-id)
             if (!empty($messageId) && Inquiry::query()->where('external_id', $messageId)->exists()) {
                 $message->setFlag('Seen');
                 continue;
             }
 
-            // body: prefer text, fallback html
+            // Body: prefer text, fallback html (ne stripujemo da ne izgubimo bitno)
             $body = (string) ($message->getTextBody() ?: $message->getHTMLBody() ?: '');
+            $body = trim($body) !== '' ? trim($body) : '[EMPTY_BODY]';
 
-            // minimalna normalizacija (da ne upisujemo baš prazan)
-            $body = trim(strip_tags($body)) ?: '[EMPTY_BODY]';
+            // received_at iz mejla (fallback now)
+            $receivedAt = null;
+            try {
+                $date = $message->getDate();
+                if ($date) {
+                    $receivedAt = \Carbon\Carbon::parse($date);
+                }
+            } catch (\Throwable $e) {
+                $receivedAt = now();
+            }
 
-            // upis u DB
             Inquiry::create([
-                'source'       => "email:{$inboxKey}",
-                'external_id'  => $messageId ?: null,
+                'source'      => "email:{$inboxKey}",
+                'external_id' => $messageId ?: null,
 
-                'guest_email'  => $fromEmail ?: null,
-                'subject'      => $subject ?: null,
-                'raw_message'  => $body,
+                'guest_email' => $fromEmail ?: null,
+                'subject'     => $subject ?: null,
+                'raw_message' => $body,
 
-                'status'       => 'new',
-                'received_at'  => now(),
+                'status'      => 'new',
+                'received_at' => $receivedAt ?? now(),
             ]);
 
-            // mark seen tek kad smo uspešno snimili
+            // Mark seen tek kad smo uspešno snimili
             $message->setFlag('Seen');
             $count++;
         }
