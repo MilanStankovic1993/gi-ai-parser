@@ -100,6 +100,7 @@ TXT;
 
         // 6) Check-in date (very basic; ako ne nađe, null)
         $checkIn = $this->extractCheckIn($lower);
+        $monthHint = $this->extractMonthHint($lower);
 
         // 7) Wants flags
         $wants = $this->extractWants($lower);
@@ -113,6 +114,7 @@ TXT;
             'children' => $children,
             'budget_per_night' => $budget,
             'wants' => $wants,
+            'month_hint' => $monthHint,
             'language' => $language,
             '_note' => 'AI disabled (AI_ENABLED=false) - heuristic fallback',
         ];
@@ -219,6 +221,31 @@ TXT;
             $n = (int) $m[1];
             return ($n > 0 && $n <= 60) ? $n : null;
         }
+        return null;
+    }
+    protected function extractMonthHint(string $lower): ?string
+    {
+        $months = [
+            'januar','februar','mart','april','maj','jun','jul','avgust','septembar','oktobar','novembar','decembar'
+        ];
+
+        foreach ($months as $m) {
+            if (Str::contains($lower, [$m, $m.'u', $m.'a', $m.'u'])) {
+                return $m;
+            }
+        }
+
+        // skraćenice
+        $short = [
+            'jan' => 'januar', 'feb' => 'februar', 'mar' => 'mart', 'apr' => 'april',
+            'jun' => 'jun', 'jul' => 'jul', 'avg' => 'avgust', 'sep' => 'septembar',
+            'okt' => 'oktobar', 'nov' => 'novembar', 'dec' => 'decembar',
+        ];
+
+        foreach ($short as $k => $full) {
+            if (preg_match('/\b'.$k.'\b/u', $lower)) return $full;
+        }
+
         return null;
     }
 

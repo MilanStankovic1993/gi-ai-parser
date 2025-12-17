@@ -78,4 +78,9 @@ class Inquiry extends Model
 
         'is_priority' => 'boolean',
     ];
+    public function aiInquiry()
+    {
+        return $this->hasOne(\App\Models\AiInquiry::class, 'inquiry_id');
+    }
+
 }

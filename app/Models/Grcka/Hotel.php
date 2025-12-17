@@ -28,6 +28,15 @@ class Hotel extends Model
     }
 
     /**
+     * Ako je u bazi hotel_city upisan kao ID (npr 270),
+     * ovo omogućava da prikažemo naziv lokacije + region kao u njihovom adminu.
+     */
+    public function location()
+    {
+        return $this->belongsTo(Location::class, 'hotel_city', 'id');
+    }
+
+    /**
      * Faza 1 (1:1):
      * - provizijski: email booking@ / info@
      * - Booking=YES
@@ -59,8 +68,7 @@ class Hotel extends Model
     }
 
     /**
-     * Minimalan “region/location” filter bez oslanjanja na pt_locations relaciju.
-     * (region string iz inquiry-a najčešće matchuje mesto/hotel_map_city/hotel_city)
+     * Minimalan “region/location” filter (string match).
      */
     public function scopeMatchRegion(Builder $query, ?string $region): Builder
     {
@@ -78,7 +86,6 @@ class Hotel extends Model
 
     public function getPublicUrlAttribute(): ?string
     {
-        // prilagodi po realnom URL formatu sajta
         if (! $this->hotel_slug) {
             return null;
         }
@@ -86,5 +93,28 @@ class Hotel extends Model
         $base = rtrim(config('app.grcka_site_url', 'https://www.grckainfo.com'), '/');
 
         return "{$base}/smestaj/{$this->hotel_slug}";
+    }
+
+    public function getLocationLabelAttribute(): ?string
+    {
+        if ($this->relationLoaded('location') && $this->location) {
+            $locName = trim((string) ($this->location->location ?? ''));
+            $regName = trim((string) ($this->location->region->region ?? ''));
+            $out = trim($locName . ($regName !== '' ? ', ' . $regName : ''));
+            return $out !== '' ? $out : null;
+        }
+
+        // ako nije eager-load-ovano, probaj bez dodatnog query-ja:
+        $fallback = trim((string) ($this->hotel_map_city ?: $this->mesto ?: ''));
+
+        // ako je hotel_city tekst (nije broj), može i to:
+        if ($fallback === '') {
+            $city = trim((string) ($this->hotel_city ?? ''));
+            if ($city !== '' && ! preg_match('/^\d+$/', $city)) {
+                $fallback = $city;
+            }
+        }
+
+        return $fallback !== '' ? $fallback : null;
     }
 }

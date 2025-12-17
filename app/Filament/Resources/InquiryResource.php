@@ -173,8 +173,26 @@ class InquiryResource extends Resource
                     ]),
             ])
             ->actions([
+                Tables\Actions\Action::make('parse')
+                    ->label('Parse')
+                    ->icon('heroicon-o-sparkles')
+                    ->color('primary')
+                    ->action(function (Inquiry $record) {
+                        // samo otvori record – parse ćemo raditi na View strani (da agent vidi log)
+                        return redirect(InquiryResource::getUrl('view', ['record' => $record]));
+                    }),
+
                 Tables\Actions\ViewAction::make()->label('Open')->icon('heroicon-o-eye'),
+
+                Tables\Actions\Action::make('suggest')
+                    ->label('Suggest')
+                    ->icon('heroicon-o-building-office-2')
+                    ->color('warning')
+                    ->action(function (Inquiry $record) {
+                        return redirect(InquiryResource::getUrl('view', ['record' => $record]) . '?tab=Predlozi%20sme%C5%A1taja');
+                    }),
             ])
+
             ->bulkActions([
                 Tables\Actions\BulkActionGroup::make([]),
             ]);
