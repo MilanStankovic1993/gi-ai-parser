@@ -14,8 +14,8 @@ class Hotel extends Model
 
     protected $casts = [
         'placen'   => 'integer',
-        'booking'  => 'integer',
-        'cene2024' => 'integer',
+        'booking'  => 'string',
+        'cene2024' => 'string',
         'ai_order' => 'integer',
         'hotel_udaljenost_plaza' => 'integer',
         'sortOrder' => 'integer',
@@ -27,22 +27,11 @@ class Hotel extends Model
             ->where('room_status', 'Yes');
     }
 
-    /**
-     * Ako je u bazi hotel_city upisan kao ID (npr 270),
-     * ovo omogućava da prikažemo naziv lokacije + region kao u njihovom adminu.
-     */
     public function location()
     {
         return $this->belongsTo(Location::class, 'hotel_city', 'id');
     }
 
-    /**
-     * Faza 1 (1:1):
-     * - provizijski: email booking@ / info@
-     * - Booking=YES
-     * - "Až. cene za 2024"=YES (cene2024=1)
-     * - hotel_status=Yes
-     */
     public function scopeAiEligible(Builder $query): Builder
     {
         return $query
@@ -51,13 +40,10 @@ class Hotel extends Model
                 $q->whereIn('hotel_email', ['booking@grckainfo.com', 'info@grckainfo.com'])
                   ->orWhereIn('custom_email', ['booking@grckainfo.com', 'info@grckainfo.com']);
             })
-            ->where('booking', 1)
-            ->where('cene2024', 1);
+            ->whereIn('booking', ['1', 'Yes', 'YES', 1])
+            ->whereIn('cene2024', ['1', 'Yes', 'YES', 1]);
     }
 
-    /**
-     * 10 najveći prioritet (DESC). NULL na kraj.
-     */
     public function scopeAiOrdered(Builder $query): Builder
     {
         return $query
@@ -67,15 +53,10 @@ class Hotel extends Model
             ->orderBy('hotel_id');
     }
 
-    /**
-     * Minimalan “region/location” filter (string match).
-     */
     public function scopeMatchRegion(Builder $query, ?string $region): Builder
     {
         $region = trim((string) $region);
-        if ($region === '') {
-            return $query;
-        }
+        if ($region === '') return $query;
 
         return $query->where(function (Builder $q) use ($region) {
             $q->where('mesto', 'like', "%{$region}%")
@@ -86,12 +67,9 @@ class Hotel extends Model
 
     public function getPublicUrlAttribute(): ?string
     {
-        if (! $this->hotel_slug) {
-            return null;
-        }
+        if (! $this->hotel_slug) return null;
 
         $base = rtrim(config('app.grcka_site_url', 'https://www.grckainfo.com'), '/');
-
         return "{$base}/smestaj/{$this->hotel_slug}";
     }
 
@@ -104,10 +82,7 @@ class Hotel extends Model
             return $out !== '' ? $out : null;
         }
 
-        // ako nije eager-load-ovano, probaj bez dodatnog query-ja:
         $fallback = trim((string) ($this->hotel_map_city ?: $this->mesto ?: ''));
-
-        // ako je hotel_city tekst (nije broj), može i to:
         if ($fallback === '') {
             $city = trim((string) ($this->hotel_city ?? ''));
             if ($city !== '' && ! preg_match('/^\d+$/', $city)) {

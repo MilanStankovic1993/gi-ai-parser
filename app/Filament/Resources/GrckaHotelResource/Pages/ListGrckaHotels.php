@@ -12,7 +12,7 @@ class ListGrckaHotels extends ListRecords
     protected function getHeaderActions(): array
     {
         return [
-            // read-only lista, ništa
+            // read-only lista
         ];
     }
 }

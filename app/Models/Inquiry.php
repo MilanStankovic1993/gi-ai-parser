@@ -4,10 +4,18 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use App\Services\InquiryMissingData;
 
 class Inquiry extends Model
 {
     use HasFactory;
+
+    // Statusi (drži jasno u jednom mestu)
+    public const STATUS_NEW        = 'new';
+    public const STATUS_IN_REVIEW  = 'in_review';
+    public const STATUS_DONE       = 'done';
+    public const STATUS_NO_AI      = 'no_ai';       // npr. limit reached ili ai_stopped
+    public const STATUS_NEEDS_INFO = 'needs_info';  // missing data
 
     protected $fillable = [
         'source',
@@ -21,7 +29,6 @@ class Inquiry extends Model
         'raw_message',
         'ai_draft',
 
-        // extracted summary
         'region',
         'location',
         'month_hint',
@@ -42,7 +49,6 @@ class Inquiry extends Model
         'wants_pool',
         'special_requirements',
 
-        // extraction meta (prod korisno)
         'extraction_mode',
         'extraction_debug',
         'language',
@@ -69,6 +75,7 @@ class Inquiry extends Model
         'budget_max'   => 'integer',
 
         'children_ages' => 'array',
+        'extraction_debug' => 'array',
 
         'wants_near_beach' => 'boolean',
         'wants_parking'    => 'boolean',
@@ -78,9 +85,47 @@ class Inquiry extends Model
 
         'is_priority' => 'boolean',
     ];
+
+    protected $attributes = [
+        'status' => self::STATUS_NEW,
+        'is_priority' => false,
+    ];
+
     public function aiInquiry()
     {
-        return $this->hasOne(\App\Models\AiInquiry::class, 'inquiry_id');
+        return $this->hasOne(AiInquiry::class, 'inquiry_id');
     }
 
+    /**
+     * Normalizacija children_ages:
+     * - null | "5,3" | "[5,3]" | ["5","3"] -> [5,3]
+     */
+    public function getChildrenAgesAttribute($value): array
+    {
+        // $value može biti: null | string | array (zbog $casts)
+        return InquiryMissingData::normalizeChildrenAges($value);
+    }
+
+    public function setChildrenAgesAttribute($value): void
+    {
+        $ages = InquiryMissingData::normalizeChildrenAges($value);
+
+        // ✅ u bazi čuvamo JSON string (da bude stabilno), a accessor vraća array
+        $this->attributes['children_ages'] = json_encode($ages, JSON_UNESCAPED_UNICODE);
+    }
+
+    public function scopePriority($q)
+    {
+        return $q->where('is_priority', true);
+    }
+
+    public function scopeNew($q)
+    {
+        return $q->where('status', self::STATUS_NEW);
+    }
+
+    public function scopeNeedsInfo($q)
+    {
+        return $q->where('status', self::STATUS_NEEDS_INFO);
+    }
 }

@@ -6,7 +6,6 @@ use Illuminate\Support\ServiceProvider;
 use App\Ai\Email\EmailInboxProviderInterface;
 use App\Ai\AiClient\AiClientInterface;
 
-// Implementacije dodajemo u sledećim koracima:
 use App\Ai\Email\Providers\LocalEmailInboxProvider;
 use App\Ai\AiClient\Providers\FakeAiClient;
 

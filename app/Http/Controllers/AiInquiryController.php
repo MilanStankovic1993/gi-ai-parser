@@ -2,31 +2,28 @@
 
 namespace App\Http\Controllers;
 
-use App\Services\Ai\AiInquiryParser;
+use App\Models\Inquiry;
+use App\Services\InquiryAiExtractor;
 use Illuminate\Http\Request;
 
 class AiInquiryController extends Controller
 {
     public function __construct(
-        protected AiInquiryParser $parser,
+        protected InquiryAiExtractor $extractor,
     ) {}
 
     public function parse(Request $request)
     {
-        // 1) Validacija – očekujemo samo raw_text
-        $validated = $request->validate([
+        $rawText = $request->validate([
             'raw_text' => 'required|string',
-        ]);
+        ])['raw_text'];
 
-        $rawText = $validated['raw_text'];
+        $inquiry = new Inquiry(['raw_message' => $rawText]);
+        $parsed  = $this->extractor->extract($inquiry);
 
-        // 2) Zovemo naš mali parser (za sada heuristika, kasnije AI)
-        $parsed = $parserResult = $this->parser->parse($rawText);
-
-        // 3) Vraćamo strukturirani odgovor
         return response()->json([
             'raw_text' => $rawText,
             'parsed'   => $parsed,
-        ]);
+        ], 200, [], JSON_UNESCAPED_UNICODE);
     }
 }

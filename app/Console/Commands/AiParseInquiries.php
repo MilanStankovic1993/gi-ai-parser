@@ -2,13 +2,13 @@
 
 namespace App\Console\Commands;
 
+use App\Models\AiInquiry;
+use App\Models\Inquiry;
+use App\Services\InquiryAiExtractor;
+use App\Services\InquiryMissingData;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
-
-use App\Models\AiInquiry;
-use App\Models\Inquiry;
-use App\Services\Ai\AiInquiryParser;
 
 class AiParseInquiries extends Command
 {
@@ -19,7 +19,7 @@ class AiParseInquiries extends Command
 
     protected $description = 'Parse ai_inquiries -> fill Inquiry fields (uses fallback when AI_ENABLED=false).';
 
-    public function handle(AiInquiryParser $parser): int
+    public function handle(InquiryAiExtractor $extractor): int
     {
         $limit = (int) $this->option('limit');
         $retry = (bool) $this->option('retry');
@@ -44,8 +44,9 @@ class AiParseInquiries extends Command
 
         foreach ($items as $ai) {
             try {
-                DB::transaction(function () use ($ai, $parser, $force, &$processed, &$skipped) {
-                    $inquiry = Inquiry::find($ai->inquiry_id);
+                DB::transaction(function () use ($ai, $extractor, $force, &$processed, &$skipped) {
+                    /** @var Inquiry|null $inquiry */
+                    $inquiry = Inquiry::query()->find($ai->inquiry_id);
 
                     if (! $inquiry) {
                         $ai->status = 'error';
@@ -56,7 +57,7 @@ class AiParseInquiries extends Command
                         return;
                     }
 
-                    // Ako je Inquiry već u kasnijoj fazi (suggested/replied/closed), ne diramo ga.
+                    // Ako je već u kasnijoj fazi, ne diramo
                     if (in_array($inquiry->status, ['suggested', 'replied', 'closed'], true)) {
                         $ai->status = 'parsed';
                         $ai->missing_fields = null;
@@ -66,32 +67,22 @@ class AiParseInquiries extends Command
                         return;
                     }
 
-                    $parsed = $parser->parse((string) $inquiry->raw_message);
+                    $out = $extractor->extract($inquiry); // vraća standardizovan array + _mode
 
-                    // Popunjavaj samo prazna polja (osim ako je --force)
-                    $this->fill($inquiry, $parsed, $force);
+                    $this->fillFromExtractor($inquiry, $out, $force);
 
-                    $missing = $this->computeMissing($inquiry);
+                    $missingHuman = InquiryMissingData::detect($inquiry);
 
-                    $inquiry->extraction_mode  = filter_var(env('AI_ENABLED', true), FILTER_VALIDATE_BOOL) ? 'ai' : 'fallback';
-                    $inquiry->extraction_debug = json_encode($parsed, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                    $inquiry->extraction_mode  = (string) ($out['_mode'] ?? 'fallback');
+                    $inquiry->extraction_debug = json_encode($out, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
                     $inquiry->processed_at     = Carbon::now();
 
-                    // Status ENUM: ne “downgrade”-uj extracted nazad na new
-                    if (empty($missing)) {
-                        $inquiry->status = 'extracted';
-                    } else {
-                        if ($inquiry->status !== 'extracted') {
-                            $inquiry->status = 'new';
-                        }
-                    }
-
+                    $inquiry->status = empty($missingHuman) ? 'extracted' : 'new';
                     $inquiry->save();
 
-                    // Pipeline status (free string)
-                    $ai->status = empty($missing) ? 'parsed' : 'needs_info';
+                    $ai->status = empty($missingHuman) ? 'parsed' : 'needs_info';
+                    $ai->missing_fields = empty($missingHuman) ? null : $missingHuman;
                     $ai->parsed_at = Carbon::now();
-                    $ai->missing_fields = $missing ?: null;
                     $ai->save();
 
                     $processed++;
@@ -99,7 +90,6 @@ class AiParseInquiries extends Command
             } catch (\Throwable $e) {
                 $failed++;
 
-                // Ne rušimo celu komandu; beležimo u ai_inquiries
                 try {
                     $ai->status = 'error';
                     $ai->missing_fields = array_values(array_unique(array_filter([
@@ -109,7 +99,7 @@ class AiParseInquiries extends Command
                     $ai->parsed_at = Carbon::now();
                     $ai->save();
                 } catch (\Throwable) {
-                    // ignore secondary failure
+                    // ignore
                 }
             }
         }
@@ -118,97 +108,45 @@ class AiParseInquiries extends Command
         return self::SUCCESS;
     }
 
-    private function fill(Inquiry $inquiry, array $parsed, bool $force): void
+    private function fillFromExtractor(Inquiry $inquiry, array $out, bool $force): void
     {
-        $setIfEmpty = function (string $field, $value) use ($inquiry, $force) {
-            if ($value === null || $value === '') return;
-            if ($force || empty($inquiry->{$field})) {
+        $set = function (string $field, $value) use ($inquiry, $force) {
+            if ($value === null || $value === '') {
+                return;
+            }
+            if ($force || $inquiry->{$field} === null || $inquiry->{$field} === '' ) {
                 $inquiry->{$field} = $value;
             }
         };
 
-        $setIfEmpty('region',   $parsed['region']   ?? null);
-        $setIfEmpty('location', $parsed['location'] ?? null);
+        $set('region', $out['region'] ?? null);
+        $set('location', $out['location'] ?? null);
+        $set('month_hint', $out['month_hint'] ?? null);
 
-        // datumi
-        if (!empty($parsed['check_in'])) {
-            $setIfEmpty('date_from', $parsed['check_in']); // YYYY-MM-DD
-        }
-        $setIfEmpty('month_hint', $parsed['month_hint'] ?? null);
+        $set('date_from', $out['date_from'] ?? null);
+        $set('date_to', $out['date_to'] ?? null);
+        $set('nights', $out['nights'] ?? null);
 
-        $setIfEmpty('nights',  $parsed['nights'] ?? null);
-        $setIfEmpty('adults',  $parsed['adults'] ?? null);
+        $set('adults', $out['adults'] ?? null);
+        $set('children', $out['children'] ?? null);
 
-        // children: array<['age'=>..]>
-        $childrenArr = $parsed['children'] ?? null;
-        if (is_array($childrenArr)) {
-            if ($force || $inquiry->children === null) {
-                $inquiry->children = count($childrenArr);
-            }
-
-            $ages = [];
-            foreach ($childrenArr as $c) {
-                $age = $c['age'] ?? null;
-                if (is_numeric($age)) $ages[] = (int) $age;
-            }
-            $ages = array_values(array_unique($ages));
-
-            if (!empty($ages)) {
-                // kolona je string, snimamo JSON string
-                if ($force || empty($inquiry->children_ages)) {
-                    $inquiry->children_ages = json_encode($ages, JSON_UNESCAPED_UNICODE);
-                }
+        // children_ages je cast array u modelu
+        if (array_key_exists('children_ages', $out) && is_array($out['children_ages'])) {
+            if ($force || empty($inquiry->children_ages)) {
+                $inquiry->children_ages = $out['children_ages'];
             }
         }
 
-        // budžet (int)
-        if (isset($parsed['budget_per_night']) && is_numeric($parsed['budget_per_night'])) {
-            $budget = (int) $parsed['budget_per_night'];
-            if ($budget > 0) {
-                $setIfEmpty('budget_max', $budget);
-            }
-        }
+        $set('budget_min', $out['budget_min'] ?? null);
+        $set('budget_max', $out['budget_max'] ?? null);
 
-        // wants[]
-        $wants = $parsed['wants'] ?? null;
-        if (is_array($wants)) {
-            $map = [
-                'close_to_beach' => 'wants_near_beach',
-                'parking'        => 'wants_parking',
-                'quiet'          => 'wants_quiet',
-                'pool'           => 'wants_pool',
-                'pets_allowed'   => 'wants_pets',
-            ];
+        $set('wants_near_beach', $out['wants_near_beach'] ?? null);
+        $set('wants_parking', $out['wants_parking'] ?? null);
+        $set('wants_quiet', $out['wants_quiet'] ?? null);
+        $set('wants_pets', $out['wants_pets'] ?? null);
+        $set('wants_pool', $out['wants_pool'] ?? null);
 
-            foreach ($map as $wantKey => $field) {
-                if (in_array($wantKey, $wants, true)) {
-                    if ($force || $inquiry->{$field} === null) {
-                        $inquiry->{$field} = 1;
-                    }
-                }
-            }
-        }
-
-        $setIfEmpty('language', $parsed['language'] ?? null);
-    }
-
-    private function computeMissing(Inquiry $inquiry): array
-    {
-        $missing = [];
-
-        $hasPeople = (int) ($inquiry->adults ?? 0) > 0 || (int) ($inquiry->children ?? 0) > 0;
-        if (! $hasPeople) $missing[] = 'people';
-
-        $hasDates = !empty($inquiry->date_from) || !empty($inquiry->date_to) || !empty($inquiry->month_hint);
-        if (! $hasDates) $missing[] = 'dates';
-
-        if ((int) ($inquiry->children ?? 0) > 0) {
-            $ages = $inquiry->children_ages;
-            if (empty($ages) || (is_string($ages) && trim($ages) === '')) {
-                $missing[] = 'children_ages';
-            }
-        }
-
-        return $missing;
+        $set('special_requirements', $out['special_requirements'] ?? null);
+        $set('language', $out['language'] ?? null);
     }
 }

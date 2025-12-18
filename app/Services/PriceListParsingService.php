@@ -7,22 +7,31 @@ use App\Services\Contracts\PriceListParserInterface;
 
 class PriceListParsingService
 {
+    public function __construct(
+        protected ExcelPriceListParser $excelParser,
+        protected FakePriceListParser $fakeParser,
+    ) {}
+
     /**
      * Glavna ulazna tačka za parsiranje cenovnika.
      */
     public function parse(PriceList $priceList): array
     {
-        $filename = $priceList->original_filename ?? '';
+        $filename = (string) ($priceList->original_filename ?? '');
         $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
 
-        // Za xlsx/xls fajlove koristimo Excel parser
-        if (in_array($ext, ['xlsx', 'xls'])) {
-            $parser = new ExcelPriceListParser();
-        } else {
-            // Za sada za sve ostalo otpada na fake parser
-            $parser = new FakePriceListParser();
-        }
+        $parser = $this->resolveParserByExtension($ext);
 
         return $parser->parse($priceList);
+    }
+
+    protected function resolveParserByExtension(string $ext): PriceListParserInterface
+    {
+        if (in_array($ext, ['xlsx', 'xls'], true)) {
+            return $this->excelParser;
+        }
+
+        // dok ne ubaciš OCR/AI parser za PDF/slike
+        return $this->fakeParser;
     }
 }

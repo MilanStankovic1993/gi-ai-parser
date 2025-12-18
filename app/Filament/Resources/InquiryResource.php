@@ -8,6 +8,7 @@ use Filament\Forms\Form;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
+use Illuminate\Support\Arr;
 
 class InquiryResource extends Resource
 {
@@ -45,12 +46,44 @@ class InquiryResource extends Resource
                     \Filament\Forms\Components\DatePicker::make('date_to')->label('Datum do'),
 
                     \Filament\Forms\Components\TextInput::make('adults')->label('Odrasli')->numeric()->minValue(0),
-
                     \Filament\Forms\Components\TextInput::make('children')->label('Deca')->numeric()->minValue(0),
 
+                    // children_ages je cast array u modelu => u formi ga prikazujemo kao string,
+                    // i pretvaramo nazad u array pre snimanja.
                     \Filament\Forms\Components\TextInput::make('children_ages')
                         ->label('Uzrast dece (npr: 5 ili 5, 8)')
-                        ->maxLength(255),
+                        ->maxLength(255)
+                        ->formatStateUsing(function ($state) {
+                            if (is_array($state)) {
+                                return implode(', ', array_values($state));
+                            }
+                            return is_string($state) ? $state : null;
+                        })
+                        ->dehydrateStateUsing(function ($state) {
+                            if ($state === null) {
+                                return [];
+                            }
+                            if (is_array($state)) {
+                                return array_values($state);
+                            }
+
+                            $txt = trim((string) $state);
+                            if ($txt === '') {
+                                return [];
+                            }
+
+                            $parts = preg_split('/[,\s;]+/', $txt) ?: [];
+                            $nums = [];
+                            foreach ($parts as $p) {
+                                $n = preg_replace('/\D+/', '', (string) $p);
+                                if ($n !== '') {
+                                    $nums[] = (int) $n;
+                                }
+                            }
+                            $nums = array_values(array_unique(array_filter($nums, fn ($n) => $n >= 0 && $n <= 17)));
+
+                            return $nums;
+                        }),
 
                     \Filament\Forms\Components\TextInput::make('budget_min')->label('Budžet min')->numeric()->minValue(0),
                     \Filament\Forms\Components\TextInput::make('budget_max')->label('Budžet max')->numeric()->minValue(0),
@@ -109,24 +142,31 @@ class InquiryResource extends Resource
                         }
                         return $record->guest_name ?: 'N/A';
                     })
-                    ->searchable(),
+                    ->searchable(query: function ($query, string $search) {
+                        // pretraga i po email-u
+                        $query->where(function ($q) use ($search) {
+                            $q->where('guest_name', 'like', "%{$search}%")
+                              ->orWhere('guest_email', 'like', "%{$search}%");
+                        });
+                    }),
 
                 Tables\Columns\TextColumn::make('subject')
                     ->label('Upit')
                     ->limit(60)
-                    ->tooltip(fn (Inquiry $record) => $record->raw_message)
+                    ->tooltip(fn (Inquiry $record) => $record->raw_message ?: $record->subject)
                     ->searchable(),
 
                 Tables\Columns\TextColumn::make('region')->label('Regija')->sortable()->toggleable(),
 
+                // Filament v3: colors() mapa state => color
                 Tables\Columns\BadgeColumn::make('status')
                     ->label('Status')
                     ->colors([
-                        'gray'    => 'new',
-                        'warning' => 'extracted',
-                        'info'    => 'suggested',
-                        'success' => 'replied',
-                        'danger'  => 'closed',
+                        'new'       => 'gray',
+                        'extracted' => 'warning',
+                        'suggested' => 'info',
+                        'replied'   => 'success',
+                        'closed'    => 'danger',
                     ])
                     ->formatStateUsing(fn ($state) => match ($state) {
                         'new'       => 'New',
@@ -134,15 +174,15 @@ class InquiryResource extends Resource
                         'suggested' => 'Suggested',
                         'replied'   => 'Replied',
                         'closed'    => 'Closed',
-                        default     => $state,
+                        default     => (string) $state,
                     })
                     ->sortable(),
 
                 Tables\Columns\BadgeColumn::make('reply_mode')
                     ->label('Odgovor')
                     ->colors([
-                        'primary'   => 'ai_draft',
-                        'secondary' => 'manual',
+                        'ai_draft' => 'primary',
+                        'manual'   => 'secondary',
                     ])
                     ->formatStateUsing(fn ($state) => $state === 'ai_draft' ? 'AI draft' : 'Ručni'),
             ])
@@ -173,24 +213,7 @@ class InquiryResource extends Resource
                     ]),
             ])
             ->actions([
-                Tables\Actions\Action::make('parse')
-                    ->label('Parse')
-                    ->icon('heroicon-o-sparkles')
-                    ->color('primary')
-                    ->action(function (Inquiry $record) {
-                        // samo otvori record – parse ćemo raditi na View strani (da agent vidi log)
-                        return redirect(InquiryResource::getUrl('view', ['record' => $record]));
-                    }),
-
                 Tables\Actions\ViewAction::make()->label('Open')->icon('heroicon-o-eye'),
-
-                Tables\Actions\Action::make('suggest')
-                    ->label('Suggest')
-                    ->icon('heroicon-o-building-office-2')
-                    ->color('warning')
-                    ->action(function (Inquiry $record) {
-                        return redirect(InquiryResource::getUrl('view', ['record' => $record]) . '?tab=Predlozi%20sme%C5%A1taja');
-                    }),
             ])
 
             ->bulkActions([

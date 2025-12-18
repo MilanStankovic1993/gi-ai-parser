@@ -24,13 +24,9 @@ class GrckaHotelResource extends Resource
         return false;
     }
 
-    /**
-     * ✅ CELA BAZA (kao kod njih)
-     * - NEMA aiEligible ovde
-     * - NEMA agregata ovde (da ne ubije performanse na 3k+ hotela)
-     */
     public static function getEloquentQuery(): Builder
     {
+        // cela baza kao kod njih
         return parent::getEloquentQuery();
     }
 
@@ -40,42 +36,34 @@ class GrckaHotelResource extends Resource
             ->deferLoading()
             ->paginated([25, 50, 100])
             ->defaultPaginationPageOption(25)
-            ->deferFilters(false)
 
-            /**
-             * ✅ Agregate i eager-load dodaj samo kad treba (MAX performance)
-             */
             ->modifyQueryUsing(function (Builder $query, Table $table) {
-                // 1) Location label koristi accessor koji pokušava eager-load,
-                // pa učitaj location samo ako je kolona uključena (u praksi: skoro uvek),
-                // ali ovo ipak štedi kad kolonu ugasiš.
-                // (Filament nema uvek 100% pouzdan API za "is column visible", pa radimo safe-load)
+                // location label accessor ti je dobar kad eager-loaduješ region
                 $query->with(['location.region']);
 
-                // 2) Agregati su najskuplji -> dodaj ih samo kad treba:
-                // - kad user sortira po min_basic_price / max_* / min_min_stay
-                // - kad je uključen capacity filter (jer ionako radi whereHas rooms)
-                $sortColumn = method_exists($table, 'getSortColumn') ? $table->getSortColumn() : null;
-                $sortNeedsAggregates = in_array($sortColumn, [
-                    'min_basic_price', 'max_adults', 'max_children', 'min_min_stay',
-                ], true);
-
-                // heuristika: ako je capacity filter aktivan (unet adults/children/min_stay), onda dodaj agregate
-                $filters = method_exists($table, 'getFilters') ? $table->getFilters() : null;
+                // agregati: uključujemo ih samo kad je capacity filter aktivan ili kad user sortira po agregat koloni.
                 $capacityActive = false;
+                $sortColumn = null;
 
-                // Filament internal: ovo neće baciti grešku ako ne postoji, samo ostaje false
                 try {
-                    $filterState = $table->getLivewire()->getTableFilterState();
+                    $lw = $table->getLivewire();
+                    $sortColumn = method_exists($lw, 'getTableSortColumn') ? $lw->getTableSortColumn() : null;
+
+                    $filterState = method_exists($lw, 'getTableFilterState') ? $lw->getTableFilterState() : [];
                     $cap = $filterState['capacity'] ?? [];
+
                     $capacityActive = (
                         (isset($cap['adults']) && $cap['adults'] !== '' && $cap['adults'] !== null) ||
                         (isset($cap['children']) && $cap['children'] !== '' && $cap['children'] !== null) ||
                         (isset($cap['min_stay']) && $cap['min_stay'] !== '' && $cap['min_stay'] !== null)
                     );
-                } catch (\Throwable $e) {
+                } catch (\Throwable) {
                     // ignore
                 }
+
+                $sortNeedsAggregates = in_array($sortColumn, [
+                    'min_basic_price', 'max_adults', 'max_children', 'min_min_stay',
+                ], true);
 
                 if ($sortNeedsAggregates || $capacityActive) {
                     $query
@@ -86,16 +74,10 @@ class GrckaHotelResource extends Resource
                 }
             })
 
-            /**
-             * ✅ Default sort (brz): po hotel_id
-             * (Ai order može biti null za mnoge i nije index-friendly uvek)
-             */
             ->defaultSort('hotel_id', 'desc')
 
             ->columns([
-                Tables\Columns\TextColumn::make('hotel_id')
-                    ->label('ID')
-                    ->sortable(),
+                Tables\Columns\TextColumn::make('hotel_id')->label('ID')->sortable(),
 
                 Tables\Columns\TextColumn::make('hotel_title')
                     ->label('Hotel')
@@ -107,12 +89,10 @@ class GrckaHotelResource extends Resource
                     ->wrap()
                     ->toggleable(isToggledHiddenByDefault: false),
 
-                // ⚠️ Ovo će biti '-' dok agregati nisu uključeni (sort/capacity)
                 Tables\Columns\TextColumn::make('min_basic_price')
                     ->label('Min €')
                     ->formatStateUsing(fn ($state) => $state ? number_format((float) $state, 0, ',', '.') . ' €' : '-')
                     ->sortable(query: function (Builder $query, string $direction) {
-                        // NULL na kraj, pa sort
                         $query
                             ->orderByRaw('min_basic_price IS NULL')
                             ->orderBy('min_basic_price', $direction);
@@ -133,8 +113,8 @@ class GrckaHotelResource extends Resource
                 Tables\Columns\BadgeColumn::make('hotel_status')
                     ->label('Status')
                     ->colors([
-                        'success' => 'Yes',
-                        'danger'  => 'No',
+                        'Yes' => 'success',
+                        'No'  => 'danger',
                     ])
                     ->sortable(),
 
@@ -168,10 +148,6 @@ class GrckaHotelResource extends Resource
             ])
 
             ->filters([
-                /**
-                 * ✅ Glavni filter: AI eligible (može ON/OFF)
-                 * Default: SVI (kao kod njih)
-                 */
                 Tables\Filters\TernaryFilter::make('ai_eligible')
                     ->label('AI eligible (provizijski)')
                     ->placeholder('Svi')
@@ -180,8 +156,6 @@ class GrckaHotelResource extends Resource
                     ->queries(
                         true: fn (Builder $q) => $q->aiEligible(),
                         false: fn (Builder $q) => $q->where(function (Builder $w) {
-                            // "Bez AI eligible" = negacija pravila (grubo)
-                            // Ako ti treba striktno tačna negacija, reci i složiću ti.
                             $w->where('hotel_status', '!=', 'Yes')
                               ->orWhere('booking', '!=', 1)
                               ->orWhere('cene2024', '!=', 1);
@@ -198,7 +172,9 @@ class GrckaHotelResource extends Resource
                     ])
                     ->query(function (Builder $query, array $data) {
                         $q = trim((string) ($data['q'] ?? ''));
-                        if ($q === '') return $query;
+                        if ($q === '') {
+                            return $query;
+                        }
 
                         return $query->where(function (Builder $qq) use ($q) {
                             $qq->where('mesto', 'like', "%{$q}%")
@@ -226,7 +202,6 @@ class GrckaHotelResource extends Resource
                         $children = ($children === '' || $children === null) ? null : (int) $children;
                         $minStay  = ($minStay === '' || $minStay === null) ? null : (int) $minStay;
 
-                        // 0 tretiraj kao "nije uneto" (da ne pali whereHas)
                         if ($adults === 0) $adults = null;
                         if ($children === 0) $children = null;
                         if ($minStay === 0) $minStay = null;
@@ -260,7 +235,6 @@ class GrckaHotelResource extends Resource
                     ->label('Cene 2024=YES')
                     ->query(fn (Builder $query) => $query->where('cene2024', 1)),
             ])
-
             ->actions([])
             ->bulkActions([
                 Tables\Actions\BulkActionGroup::make([]),

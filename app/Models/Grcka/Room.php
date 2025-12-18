@@ -3,7 +3,6 @@
 namespace App\Models\Grcka;
 
 use Illuminate\Database\Eloquent\Model;
-use Illuminate\Database\Eloquent\Builder;
 
 class Room extends Model
 {
@@ -33,11 +32,5 @@ class Room extends Model
     public function availabilities()
     {
         return $this->hasMany(RoomAvailability::class, 'room_id', 'room_id');
-    }
-    public function scopeOverlaps(Builder $q, $from, $to): Builder
-    {
-        return $q
-            ->whereDate('date_from', '<=', $to)
-            ->whereDate('date_to', '>=', $from);
     }
 }

@@ -8,7 +8,7 @@ class PriceListValidator
 {
     /**
      * @param array $rows  Niz redova kao što dolazi iz parsera
-     * @return array       Niz "issue"-ova (ako je prazan → sve ok)
+     * @return array       Niz issue-ova (ako je prazan → sve ok)
      */
     public function validate(array $rows): array
     {
@@ -18,31 +18,27 @@ class PriceListValidator
         $grouped = [];
 
         foreach ($rows as $index => $row) {
-            $key = $row['tip_jedinice'] ?? 'DEFAULT';
+            $key = trim((string) ($row['tip_jedinice'] ?? ''));
+            if ($key === '') $key = 'DEFAULT';
 
             $grouped[$key][] = array_merge($row, [
-                '_index' => $index, // da znamo koji je red
+                '_index' => $index,
             ]);
         }
 
         foreach ($grouped as $unitType => $unitRows) {
-            // sortiraj po sezona_od
+            // Sortiraj po sezona_od (stabilno)
             usort($unitRows, function ($a, $b) {
-                $aFrom = $a['sezona_od'] ?? null;
-                $bFrom = $b['sezona_od'] ?? null;
-
-                return strcmp((string) $aFrom, (string) $bFrom);
+                return strcmp((string) ($a['sezona_od'] ?? ''), (string) ($b['sezona_od'] ?? ''));
             });
 
-            // proveri preklapanja i rupe
-            $prev = null;
+            $prev = null; // BITNO: resetuje se po tipu
 
             foreach ($unitRows as $row) {
                 $from = $row['sezona_od'] ?? null;
                 $to   = $row['sezona_do'] ?? null;
 
                 if (! $from || ! $to) {
-                    // ako nema datuma, prijavimo kao issue
                     $issues[] = [
                         'type'    => 'missing_dates',
                         'message' => "Nedostaju datumi za tip \"{$unitType}\" (index {$row['_index']}).",
@@ -51,8 +47,17 @@ class PriceListValidator
                     continue;
                 }
 
-                $fromDate = Carbon::parse($from);
-                $toDate   = Carbon::parse($to);
+                try {
+                    $fromDate = Carbon::parse($from)->startOfDay();
+                    $toDate   = Carbon::parse($to)->startOfDay();
+                } catch (\Throwable $e) {
+                    $issues[] = [
+                        'type'    => 'invalid_date_format',
+                        'message' => "Nevalidan format datuma za tip \"{$unitType}\" (index {$row['_index']}).",
+                        'row'     => $row['_index'],
+                    ];
+                    continue;
+                }
 
                 if ($fromDate->gt($toDate)) {
                     $issues[] = [
@@ -63,8 +68,13 @@ class PriceListValidator
                 }
 
                 if ($prev) {
-                    $prevFrom = Carbon::parse($prev['sezona_od']);
-                    $prevTo   = Carbon::parse($prev['sezona_do']);
+                    try {
+                        $prevTo = Carbon::parse($prev['sezona_do'])->startOfDay();
+                    } catch (\Throwable $e) {
+                        // ako je prev bio loš, preskoči logiku rupe/preklapanja
+                        $prev = $row;
+                        continue;
+                    }
 
                     // PREKLAPANJE: nova sezona počinje pre ili na dan kad prethodna završava
                     if ($fromDate->lte($prevTo)) {

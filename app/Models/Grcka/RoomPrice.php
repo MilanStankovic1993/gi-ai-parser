@@ -2,6 +2,7 @@
 
 namespace App\Models\Grcka;
 
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Database\Eloquent\Model;
 
 class RoomPrice extends Model
@@ -27,5 +28,15 @@ class RoomPrice extends Model
     public function room()
     {
         return $this->belongsTo(Room::class, 'room_id', 'room_id');
+    }
+
+    /**
+     * Cena mora da pokrije ceo period (to je inclusive/exclusive logika koju već koristiš u matcheru)
+     */
+    public function scopeCoversPeriod(Builder $q, string $from, string $toExclusive): Builder
+    {
+        return $q
+            ->whereDate('date_from', '<=', $from)
+            ->whereDate('date_to', '>=', $toExclusive);
     }
 }

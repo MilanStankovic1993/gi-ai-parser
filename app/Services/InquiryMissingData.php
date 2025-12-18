@@ -29,24 +29,21 @@ class InquiryMissingData
         }
 
         // 3) Deca + uzrast (1:1)
-        // - Ako je children > 0 => uzrast je obavezan (children_ages mora biti popunjen)
-        // - Ako children je null ali tekst pominje decu => tražimo broj dece + uzrast
         $mentionsKids = Str::contains($text, [
             'dete', 'deca', 'djeca', 'klinac', 'klinci', 'beba', 'baby',
             'godina', 'god', 'uzrast'
         ]);
 
         $children = $i->children;
+        $children = ($children === '' || $children === null) ? null : (int) $children;
 
-        // trim children_ages (može biti string ili null)
-        $ages = trim((string) ($i->children_ages ?? ''));
+        $ages = $i->children_ages ?? [];
+        $ages = is_array($ages) ? $ages : self::normalizeChildrenAges($ages);
 
         if ($children === null && $mentionsKids) {
             $missing[] = 'broj dece i uzrast dece';
-        }
-
-        if (is_int($children) && $children > 0) {
-            if ($ages === '') {
+        } elseif ($children !== null && $children > 0) {
+            if (count($ages) === 0) {
                 $missing[] = 'uzrast dece';
             }
         }
@@ -61,7 +58,42 @@ class InquiryMissingData
             $missing[] = 'budžet (ukupno ili po noći)';
         }
 
-        // unique + clean
         return array_values(array_unique(array_filter($missing)));
+    }
+
+    /**
+     * children_ages može biti: null | string "5,3" | JSON string | array
+     * vraća: int[] (valid ages)
+     */
+    public static function normalizeChildrenAges(mixed $value): array
+    {
+        if ($value === null) return [];
+
+        if (is_array($value)) {
+            return array_values(array_filter(array_map(function ($v) {
+                $n = is_numeric($v) ? (int) $v : null;
+                return ($n !== null && $n >= 0 && $n <= 25) ? $n : null;
+            }, $value), fn($v) => $v !== null));
+        }
+
+        if (is_string($value)) {
+            $v = trim($value);
+            if ($v === '') return [];
+
+            // probaj JSON
+            $decoded = json_decode($v, true);
+            if (is_array($decoded)) {
+                return self::normalizeChildrenAges($decoded);
+            }
+
+            // fallback: izvuci brojeve iz stringa
+            preg_match_all('/\d{1,2}/', $v, $m);
+            $nums = array_map('intval', $m[0] ?? []);
+            $nums = array_values(array_unique(array_filter($nums, fn($n) => $n >= 0 && $n <= 25)));
+
+            return $nums;
+        }
+
+        return [];
     }
 }

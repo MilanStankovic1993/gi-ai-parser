@@ -5,6 +5,7 @@ namespace App\Services;
 use App\Models\Inquiry;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 
 class InquiryAiExtractor
@@ -13,10 +14,13 @@ class InquiryAiExtractor
     {
         $text = trim((string) ($inquiry->raw_message ?? ''));
 
-        // AI toggle (radi i preko config i preko env)
+        if ($text === '') {
+            return $this->fallbackExtract($inquiry);
+        }
+
         $aiEnabled =
             (bool) config('app.ai_enabled', false) ||
-            (string) env('AI_ENABLED', 'false') === 'true';
+            filter_var(env('AI_ENABLED', false), FILTER_VALIDATE_BOOL);
 
         if (! $aiEnabled) {
             return $this->fallbackExtract($inquiry);
@@ -25,7 +29,6 @@ class InquiryAiExtractor
         $apiKey = config('services.openai.key');
         $model  = config('services.openai.model', 'gpt-4.1');
 
-        // ako nema ključa ili nije podešen services.openai, fallback
         if (! $apiKey) {
             return $this->fallbackExtract($inquiry);
         }
@@ -50,20 +53,17 @@ OSOBE:
 
 BUDŽET:
 - budget_min / budget_max kao int (EUR)
-- Ako je "budžet oko 800 eur za ceo boravak" -> budget_max=800, budget_min=null
-- Ako je "od 700 do 900" -> budget_min=700, budget_max=900
 
 LOKACIJA:
-- region: oblast/regija (npr "Halkidiki - Kassandra" ili "Thessaloniki region")
-- location: mesto (npr "Pefkohori", "Stavros", "Sarti") ako se može jasno izvući, inače null
+- region: oblast/regija
+- location: mesto
 
 ŽELJE:
 - wants_near_beach, wants_parking, wants_quiet, wants_pets, wants_pool kao true/false/null (null ako nije pomenuto)
 
 OSTALO:
-- special_requirements: kratak slobodan tekst (npr "mirno zbog deteta", "blizu plaže", itd) ako postoji.
-
-language: "sr" ili "en" (proceni po jeziku poruke)
+- special_requirements: kratak slobodan tekst
+- language: "sr" ili "en"
 SYS;
 
         $user = <<<USR
@@ -94,19 +94,27 @@ language (string|null)
 USR;
 
         try {
+            $payload = [
+                'model' => $model,
+                'temperature' => 0.1,
+                'messages' => [
+                    ['role' => 'system', 'content' => $system],
+                    ['role' => 'user', 'content' => $user],
+                ],
+                'response_format' => ['type' => 'json_object'],
+            ];
+
             $resp = Http::timeout(40)
+                ->retry(2, 400)
                 ->withToken($apiKey)
                 ->acceptJson()
-                ->post('https://api.openai.com/v1/chat/completions', [
-                    'model' => $model,
-                    'temperature' => 0.1,
-                    'messages' => [
-                        ['role' => 'system', 'content' => $system],
-                        ['role' => 'user', 'content' => $user],
-                    ],
-                ]);
+                ->post('https://api.openai.com/v1/chat/completions', $payload);
 
             if (! $resp->successful()) {
+                Log::warning('InquiryAiExtractor: OpenAI non-success', [
+                    'status' => $resp->status(),
+                    'inquiry_id' => $inquiry->id ?? null,
+                ]);
                 return $this->fallbackExtract($inquiry);
             }
 
@@ -125,6 +133,10 @@ USR;
 
             return $out;
         } catch (\Throwable $e) {
+            Log::warning('InquiryAiExtractor: exception', [
+                'inquiry_id' => $inquiry->id ?? null,
+                'message' => $e->getMessage(),
+            ]);
             return $this->fallbackExtract($inquiry);
         }
     }
@@ -158,7 +170,6 @@ USR;
             'language' => $this->nullIfEmpty(data_get($data, 'language')) ?? 'sr',
         ];
 
-        // Nights izračunaj ako ima oba datuma
         if (! $out['nights'] && $out['date_from'] && $out['date_to']) {
             try {
                 $df = Carbon::parse($out['date_from']);
@@ -168,14 +179,12 @@ USR;
             } catch (\Throwable $e) {}
         }
 
-        // Budžet fallback iz teksta ako AI nije popunio
         if (! $out['budget_min'] && ! $out['budget_max']) {
             $b = $this->extractBudgetFromText($rawText);
             $out['budget_min'] = $b['budget_min'];
             $out['budget_max'] = $b['budget_max'];
         }
 
-        // Ako AI nije dao wants, pokušaj iz teksta (ne prepisuj postojeće true/false)
         $fallbackWants = $this->extractWantsFromText($rawText);
         foreach ($fallbackWants as $k => $v) {
             if ($out[$k] === null) {
@@ -183,14 +192,16 @@ USR;
             }
         }
 
-        // Ako AI nije dao adults/children, probaj iz teksta (minimalno)
         if (! $out['adults']) {
-            $a = $this->extractAdultsFromText($rawText);
-            $out['adults'] = $a;
+            $out['adults'] = $this->extractAdultsFromText($rawText);
         }
         if ($out['children'] === null) {
-            $c = $this->extractChildrenCountFromText($rawText);
-            $out['children'] = $c;
+            $out['children'] = $this->extractChildrenCountFromText($rawText);
+        }
+
+        if ($out['children_ages'] === null) {
+            $ages = $this->extractChildrenAgesFromText($rawText);
+            $out['children_ages'] = ! empty($ages) ? $ages : null;
         }
 
         return $out;
@@ -261,6 +272,17 @@ USR;
     private function normalizeAges($v): ?array
     {
         if ($v === null) return null;
+
+        if (is_string($v)) {
+            $decoded = json_decode($v, true);
+            if (is_array($decoded)) {
+                $v = $decoded;
+            } else {
+                preg_match_all('/\d{1,2}/', $v, $m);
+                $v = $m[0] ?? [];
+            }
+        }
+
         if (! is_array($v)) return null;
 
         $ages = [];
@@ -271,32 +293,53 @@ USR;
             }
         }
 
-        return $ages;
+        return array_values(array_unique($ages));
+    }
+
+    private function parseMoneyInt(?string $s): ?int
+    {
+        if (!is_string($s)) return null;
+
+        $s = trim($s);
+        if ($s === '') return null;
+
+        $s = preg_replace('/[^\d\.\,\s]/u', '', $s);
+
+        if (str_contains($s, ',') && str_contains($s, '.')) {
+            $s = str_replace('.', '', $s);
+            $s = str_replace(',', '.', $s);
+        } else {
+            if (str_contains($s, ',')) $s = str_replace(',', '.', $s);
+            $s = str_replace(' ', '', $s);
+            if (preg_match('/\.\d{3}(\D|$)/', $s)) {
+                $s = str_replace('.', '', $s);
+            }
+        }
+
+        $n = (float) $s;
+        if ($n <= 0) return null;
+
+        return (int) round($n);
     }
 
     /**
-     * Fallback parser (šire nego pre)
+     * Fallback parser (heuristic) — produkcijski: radi i bez AI.
      */
     private function fallbackExtract(Inquiry $inquiry): array
     {
         $text = trim((string) ($inquiry->raw_message ?? ''));
         $t = mb_strtolower($text);
 
-        // region + location (jednostavno, ali proširivo)
         [$location, $region] = $this->extractLocationRegionFallback($t);
 
-        // adults/children + ages
         $adults = $this->extractAdultsFromText($text);
         $childrenCount = $this->extractChildrenCountFromText($text);
         $childrenAges = $this->extractChildrenAgesFromText($text);
 
-        // dates range
         [$dateFrom, $dateTo] = $this->extractDateRangeFromText($text);
 
-        // month_hint (okvirni period)
         $monthHint = $this->extractMonthHint($text);
 
-        // nights
         $nights = null;
         if ($dateFrom && $dateTo) {
             try {
@@ -307,13 +350,8 @@ USR;
             $nights = $this->extractNightsFromText($text);
         }
 
-        // budget
         $budget = $this->extractBudgetFromText($text);
-
-        // wants
         $wants = $this->extractWantsFromText($text);
-
-        // special requirements (kratko)
         $special = $this->extractSpecialRequirementsText($text);
 
         return [
@@ -327,7 +365,7 @@ USR;
 
             'adults' => $adults,
             'children' => $childrenCount,
-            'children_ages' => $childrenAges ?: null,
+            'children_ages' => !empty($childrenAges) ? $childrenAges : null,
 
             'budget_min' => $budget['budget_min'],
             'budget_max' => $budget['budget_max'],
@@ -347,15 +385,13 @@ USR;
 
     private function extractLocationRegionFallback(string $t): array
     {
-        // mesto -> region map (možeš proširiti)
         $map = [
             'pefkohori' => ['Pefkohori', 'Halkidiki - Kassandra'],
-            'p efkohori' => ['Pefkohori', 'Halkidiki - Kassandra'],
-            'pefkohoriu' => ['Pefkohori', 'Halkidiki - Kassandra'],
             'paliouri' => ['Paliouri', 'Halkidiki - Kassandra'],
             'hanioti' => ['Hanioti', 'Halkidiki - Kassandra'],
             'polihrono' => ['Polichrono', 'Halkidiki - Kassandra'],
             'polichrono' => ['Polichrono', 'Halkidiki - Kassandra'],
+            'kriopigi' => ['Kriopigi', 'Halkidiki - Kassandra'],
 
             'stavros' => ['Stavros', 'Thessaloniki region'],
             'asprovalta' => ['Asprovalta', 'Thessaloniki region'],
@@ -374,7 +410,6 @@ USR;
             }
         }
 
-        // fallback ako piše “Halkidiki”, “Kassandra”, “Sithonia”
         if (Str::contains($t, 'kassandra')) return [null, 'Halkidiki - Kassandra'];
         if (Str::contains($t, 'sithonia')) return [null, 'Halkidiki - Sithonia'];
         if (Str::contains($t, 'halkidiki')) return [null, 'Halkidiki'];
@@ -386,12 +421,10 @@ USR;
     {
         $t = mb_strtolower($text);
 
-        // "2 odrasle osobe", "2 odrasla", "2 odraslih"
         if (preg_match('/(\d+)\s*odrasl\w*/u', $t, $m)) {
             return (int) $m[1];
         }
 
-        // "za 2 osobe"
         if (preg_match('/za\s*(\d+)\s*osob/u', $t, $m)) {
             return (int) $m[1];
         }
@@ -403,7 +436,6 @@ USR;
     {
         $t = mb_strtolower($text);
 
-        // “1 dete”, “2 dece”
         if (preg_match('/(\d+)\s*(dece|det[ea]|children)/u', $t, $m)) {
             return (int) $m[1];
         }
@@ -416,14 +448,12 @@ USR;
         $t = mb_strtolower($text);
         $ages = [];
 
-        // “dete (5 godina)” ili “2 dece (5 godina)”
         if (preg_match_all('/det[ea]\s*\(?\s*(\d{1,2})\s*(god|g)\w*\)?/u', $t, $mm, PREG_SET_ORDER)) {
             foreach ($mm as $m) {
                 $ages[] = (int) $m[1];
             }
         }
 
-        // “uzrast 5 i 3”
         if (preg_match_all('/\b(\d{1,2})\s*(god|g)\b/u', $t, $mm, PREG_SET_ORDER)) {
             foreach ($mm as $m) {
                 $n = (int) $m[1];
@@ -433,61 +463,89 @@ USR;
             }
         }
 
-        // unique
-        $ages = array_values(array_unique($ages));
-
-        return $ages;
+        return array_values(array_unique($ages));
     }
 
+    /**
+     * ✅ PRODUKCIJSKI: datumi bez godine -> sledeći realan termin u budućnosti.
+     * Podržava: "od 01.09. do 08.09.", "01.09-08.09", "01/09 do 08/09", sa/bez godine.
+     */
     private function extractDateRangeFromText(string $text): array
     {
         $t = mb_strtolower($text);
 
-        // 15.08. do 22.08. 2025
-        if (preg_match('/\b(\d{1,2})[.\-\/](\d{1,2})[.\-\/]?\s*(?:do|\-)\s*(\d{1,2})[.\-\/](\d{1,2})[.\-\/]?\s*(\d{4})\b/u', $t, $m)) {
-            $y = (int) $m[5];
-            return [
-                Carbon::createFromDate($y, (int) $m[2], (int) $m[1])->toDateString(),
-                Carbon::createFromDate($y, (int) $m[4], (int) $m[3])->toDateString(),
-            ];
+        // 1) dd.mm.yyyy - dd.mm.yyyy (ili do)
+        if (preg_match('/\b(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\b/u', $t, $m)) {
+            $from = Carbon::createFromDate((int)$m[3], (int)$m[2], (int)$m[1])->startOfDay();
+            $to   = Carbon::createFromDate((int)$m[6], (int)$m[5], (int)$m[4])->startOfDay();
+            return [$from->toDateString(), $to->toDateString()];
         }
 
-        // 18.06 - 25.06 (godina možda fali)
-        if (preg_match('/\b(\d{1,2})[.\-\/](\d{1,2})\s*(?:do|\-)\s*(\d{1,2})[.\-\/](\d{1,2})\b/u', $t, $m)) {
-            $y = now()->year;
-            return [
-                Carbon::createFromDate($y, (int) $m[2], (int) $m[1])->toDateString(),
-                Carbon::createFromDate($y, (int) $m[4], (int) $m[3])->toDateString(),
-            ];
+        // 2) dd.mm.yyyy - dd.mm (isti year) (ređe)
+        if (preg_match('/\b(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\b/u', $t, $m)) {
+            $y = (int)$m[3];
+            $from = Carbon::createFromDate($y, (int)$m[2], (int)$m[1])->startOfDay();
+            $to   = Carbon::createFromDate($y, (int)$m[5], (int)$m[4])->startOfDay();
+            return [$from->toDateString(), $to->toDateString()];
         }
 
-        // “od 15.08. do 22.08.” (bez godine)
-        if (preg_match('/\bod\s*(\d{1,2})[.\-\/](\d{1,2})\s*(?:do|\-)\s*(\d{1,2})[.\-\/](\d{1,2})\b/u', $t, $m)) {
-            $y = now()->year;
-            return [
-                Carbon::createFromDate($y, (int) $m[2], (int) $m[1])->toDateString(),
-                Carbon::createFromDate($y, (int) $m[4], (int) $m[3])->toDateString(),
-            ];
+        // 3) dd.mm - dd.mm (bez godine) — NAJČEŠĆE kod vas
+        // prihvati i tačku posle meseca: 01.09. do 08.09.
+        if (preg_match('/\b(?:od\s*)?(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*\.?\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*\.?\b/u', $t, $m)) {
+            $d1 = (int)$m[1]; $mo1 = (int)$m[2];
+            $d2 = (int)$m[3]; $mo2 = (int)$m[4];
+
+            $from = $this->inferFutureDate($d1, $mo1);
+            $to   = $this->inferFutureDate($d2, $mo2);
+
+            // ako end ispadne pre start (npr. 28.12 - 04.01), prebacimo end u sledeću godinu
+            if ($to->lte($from)) {
+                $to = $to->copy()->addYear();
+            }
+
+            return [$from->toDateString(), $to->toDateString()];
         }
 
         return [null, null];
+    }
+
+    /**
+     * Vrati sledeći datum (d/m) koji je >= danas.
+     * Ako je već prošao u tekućoj godini -> prebaci u sledeću godinu.
+     */
+    private function inferFutureDate(int $day, int $month): Carbon
+    {
+        $today = now()->startOfDay();
+
+        // invalid guard
+        $month = max(1, min(12, $month));
+        $day   = max(1, min(31, $day));
+
+        $candidate = Carbon::create($today->year, $month, 1)->startOfDay();
+        $maxDay = $candidate->daysInMonth;
+        $day = min($day, $maxDay);
+
+        $candidate = Carbon::create($today->year, $month, $day)->startOfDay();
+
+        if ($candidate->lt($today)) {
+            $candidate = $candidate->addYear();
+        }
+
+        return $candidate;
     }
 
     private function extractMonthHint(string $text): ?string
     {
         $t = mb_strtolower($text);
 
-        // primeri: “sredina jula”, “druga polovina juna”, “početak avgusta”
         if (preg_match('/\b(sredina|po[cč]etak|kraj|druga polovina|prva polovina)\s+(januara|februara|marta|aprila|maja|juna|jula|avgusta|septembra|oktobra|novembra|decembra|jan|feb|mar|apr|maj|jun|jul|avg|sep|okt|nov|dec)\b/u', $t, $m)) {
             return trim($m[0]);
         }
 
-        // “u julu”, “tokom avgusta”
         if (preg_match('/\b(u|tokom|krajem|po[cč]etkom)\s+(januaru|februaru|martu|aprilu|maju|junu|julu|avgustu|septembru|oktobru|novembru|decembru)\b/u', $t, $m)) {
             return trim($m[0]);
         }
 
-        // “druga polovina juna ili početak jula”
         if (preg_match('/\b(druga polovina|prva polovina|po[cč]etak|sredina|kraj)\s+\w+\s+ili\s+(druga polovina|prva polovina|po[cč]etak|sredina|kraj)\s+\w+\b/u', $t, $m)) {
             return trim($m[0]);
         }
@@ -498,38 +556,61 @@ USR;
     private function extractNightsFromText(string $text): ?int
     {
         $t = mb_strtolower($text);
+
         if (preg_match('/\b(\d{1,2})\s*(noc|noci|noćenj|nocenja|night)\w*\b/u', $t, $m)) {
             return (int) $m[1];
         }
-        // “10-12 noćenja”
+
         if (preg_match('/\b(\d{1,2})\s*-\s*(\d{1,2})\s*(noc|noci|noćenj|nocenja)\b/u', $t, $m)) {
             return (int) $m[2];
         }
+
         return null;
     }
 
+    /**
+     * ✅ Budžet hvata SAMO ako postoji eur/€ ili reč "budžet"
+     * da se "od 01.09 do 08.09" ne protumači kao 1–8 EUR.
+     */
     private function extractBudgetFromText(string $text): array
     {
         $t = mb_strtolower($text);
 
-        // “od 700 do 900 eura”
-        if (preg_match('/\bod\s*(\d{2,6})\s*(eur|eura|euro|€)?\s*(do|\-)\s*(\d{2,6})\s*(eur|eura|euro|€)\b/u', $t, $m)) {
-            return ['budget_min' => (int) $m[1], 'budget_max' => (int) $m[4]];
+        $hasBudgetContext = Str::contains($t, ['€', 'eur', 'eura', 'euro', 'budžet', 'budzet', 'budget']);
+
+        if (! $hasBudgetContext) {
+            return ['budget_min' => null, 'budget_max' => null];
         }
 
-        // “do 500 eura”
-        if (preg_match('/\bdo\s*(\d{2,6})\s*(eur|eura|euro|€)\b/u', $t, $m)) {
-            return ['budget_min' => null, 'budget_max' => (int) $m[1]];
+        // od X do Y (mora da ima eur/€ ili "budžet" u blizini)
+        if (preg_match('/\b(?:budžet|budzet|budget)?\s*(?:od)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\s*(?:do|\-)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
+            return [
+                'budget_min' => $this->parseMoneyInt($m[1]),
+                'budget_max' => $this->parseMoneyInt($m[2]),
+            ];
         }
 
-        // “oko 800 eur”
-        if (preg_match('/\boko\s*(\d{2,6})\s*(eur|eura|euro|€)\b/u', $t, $m)) {
-            return ['budget_min' => null, 'budget_max' => (int) $m[1]];
+        // od X do Y (ako piše budžet ... od X do Y, a valuta samo jednom)
+        if (preg_match('/\b(?:budžet|budzet|budget)[^0-9]{0,40}od\s*([\d\.\,\s]{1,12})\s*(?:do|\-)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
+            return [
+                'budget_min' => $this->parseMoneyInt($m[1]),
+                'budget_max' => $this->parseMoneyInt($m[2]),
+            ];
         }
 
-        // fallback: prvi broj uz EUR
-        if (preg_match('/\b(\d{2,6})\s*(eur|eura|euro|€)\b/u', $t, $m)) {
-            return ['budget_min' => null, 'budget_max' => (int) $m[1]];
+        // do X EUR
+        if (preg_match('/\b(?:budžet|budzet|budget)?[^0-9]{0,40}\bdo\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
+            return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
+        }
+
+        // oko X EUR
+        if (preg_match('/\b(?:budžet|budzet|budget)?[^0-9]{0,40}\boko\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
+            return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
+        }
+
+        // bilo gde X EUR, ali samo ako postoji "budžet" ili "budget" u poruci
+        if (Str::contains($t, ['budžet', 'budzet', 'budget']) && preg_match('/\b([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
+            return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
         }
 
         return ['budget_min' => null, 'budget_max' => null];
@@ -543,13 +624,13 @@ USR;
             Str::contains($t, 'blizu pla') ||
             Str::contains($t, 'blizu plaz') ||
             Str::contains($t, 'do pla') ||
-            (Str::contains($t, 'bli') && Str::contains($t, 'plaž')); // "bliže plaži"
-        $parking   = Str::contains($t, 'parking');
-        $quiet     = (Str::contains($t, 'mirno') || Str::contains($t, 'mirna') || Str::contains($t, 'tiho'));
-        $pets      = (Str::contains($t, 'ljubim') || Str::contains($t, 'pet') || Str::contains($t, 'pas') || Str::contains($t, 'mack'));
-        $pool      = (Str::contains($t, 'bazen') || Str::contains($t, 'pool'));
+            (Str::contains($t, 'bli') && Str::contains($t, 'plaž'));
 
-        // vraćaj null ako nije pomenuto (da UI ne laže “Ne”)
+        $parking = Str::contains($t, 'parking');
+        $quiet   = (Str::contains($t, 'mirno') || Str::contains($t, 'mirna') || Str::contains($t, 'tiho'));
+        $pets    = (Str::contains($t, 'ljubim') || Str::contains($t, 'pet') || Str::contains($t, 'pas') || Str::contains($t, 'mack'));
+        $pool    = (Str::contains($t, 'bazen') || Str::contains($t, 'pool'));
+
         return [
             'wants_near_beach' => $nearBeach ? true : null,
             'wants_parking' => $parking ? true : null,
@@ -565,29 +646,19 @@ USR;
 
         $parts = [];
 
-        if (Str::contains($t, 'mirno') || Str::contains($t, 'mirna') || Str::contains($t, 'tiho')) {
-            $parts[] = 'Mirna lokacija';
-        }
-        if (Str::contains($t, 'blizu pla') || Str::contains($t, 'blizu plaz') || Str::contains($t, 'do pla')) {
-            $parts[] = 'Blizu plaže';
-        }
-        if (Str::contains($t, 'parking')) {
-            $parts[] = 'Parking';
-        }
-        if (Str::contains($t, 'ljubim') || Str::contains($t, 'pas') || Str::contains($t, 'mack')) {
-            $parts[] = 'Kućni ljubimci';
-        }
-        if (Str::contains($t, 'bazen') || Str::contains($t, 'pool')) {
-            $parts[] = 'Bazen';
-        }
+        if (Str::contains($t, ['mirno', 'mirna', 'tiho'])) $parts[] = 'Mirna lokacija';
+        if (Str::contains($t, ['blizu pla', 'blizu plaz', 'do pla'])) $parts[] = 'Blizu plaže';
+        if (Str::contains($t, 'parking')) $parts[] = 'Parking';
+        if (Str::contains($t, ['ljubim', 'pas', 'mack'])) $parts[] = 'Kućni ljubimci';
+        if (Str::contains($t, ['bazen', 'pool'])) $parts[] = 'Bazen';
 
         $parts = array_values(array_unique($parts));
+
         return empty($parts) ? null : implode(', ', $parts);
     }
 
     private function guessLanguage(string $text): string
     {
-        // dovoljno za start
         $t = mb_strtolower($text);
         if (Str::contains($t, ['hello', 'hi', 'please', 'regards'])) return 'en';
         return 'sr';

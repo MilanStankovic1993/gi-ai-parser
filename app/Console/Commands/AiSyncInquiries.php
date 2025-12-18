@@ -2,9 +2,10 @@
 
 namespace App\Console\Commands;
 
-use Illuminate\Console\Command;
 use App\Models\AiInquiry;
 use App\Models\Inquiry;
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
 
 class AiSyncInquiries extends Command
 {
@@ -23,31 +24,52 @@ class AiSyncInquiries extends Command
             ->get();
 
         $created = 0;
+        $skipped = 0;
 
         foreach ($items as $ai) {
-            // (Opcionalno) ako želiš extra dedupe na poslovnom nivou:
-            // probaj naći existing Inquiry po guest_email+subject+received_at.
-            // Za sada pravimo novi i vezujemo.
+            DB::transaction(function () use ($ai, &$created, &$skipped) {
 
-            $inquiry = Inquiry::create([
-                'source'      => 'email',
-                'guest_name'  => null,
-                'guest_email' => $ai->from_email,
-                'subject'     => $ai->subject,
-                'raw_message' => $ai->raw_body,
-                'received_at' => $ai->received_at,
-                'status'      => 'new',
-                'reply_mode'  => 'ai_draft',
-            ]);
+                // Dedupe: ako već postoji Inquiry sa external_id = message_id ili message_hash
+                $external = $ai->message_id ?: $ai->message_hash ?: null;
 
-            $ai->inquiry_id = $inquiry->id;
-            $ai->status = 'synced'; // da znamo da je prošao u poslovni sloj
-            $ai->save();
+                if ($external) {
+                    $existing = Inquiry::query()
+                        ->where('external_id', $external)
+                        ->first();
 
-            $created++;
+                    if ($existing) {
+                        $ai->inquiry_id = $existing->id;
+                        $ai->status = 'synced';
+                        $ai->save();
+
+                        $skipped++;
+                        return;
+                    }
+                }
+
+                $inquiry = Inquiry::create([
+                    'source'      => 'ai_inquiries:' . ((string) ($ai->source ?? 'email')),
+                    'external_id' => $external,
+
+                    'guest_name'  => null,
+                    'guest_email' => $ai->from_email,
+                    'subject'     => $ai->subject,
+                    'raw_message' => $ai->raw_body,
+                    'received_at' => $ai->received_at,
+
+                    'status'      => 'new',
+                    'reply_mode'  => 'ai_draft',
+                ]);
+
+                $ai->inquiry_id = $inquiry->id;
+                $ai->status = 'synced';
+                $ai->save();
+
+                $created++;
+            });
         }
 
-        $this->info("Done. Synced inquiries: {$created}");
+        $this->info("Done. Created: {$created}, Skipped: {$skipped}");
         return self::SUCCESS;
     }
 }

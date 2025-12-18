@@ -3,22 +3,33 @@
 namespace App\Providers;
 
 use Illuminate\Support\ServiceProvider;
-use App\Services\Contracts\PriceListParserInterface;
+
+use App\Services\ExcelPriceListParser;
 use App\Services\FakePriceListParser;
+use App\Services\PriceListParsingService;
+use App\Services\PriceListValidator;
+
+use App\Services\InquiryAiExtractor;
+use App\Services\InquiryAccommodationMatcher;
+use App\Services\InquiryOfferDraftBuilder;
 
 class AppServiceProvider extends ServiceProvider
 {
-    /**
-     * Register any application services.
-     */
     public function register(): void
     {
-        $this->app->bind(PriceListParserInterface::class, FakePriceListParser::class);
+        // Price list parsers + orchestrator
+        $this->app->singleton(ExcelPriceListParser::class);
+        $this->app->singleton(FakePriceListParser::class);
+        $this->app->singleton(PriceListParsingService::class);
+
+        $this->app->singleton(PriceListValidator::class);
+
+        // Inquiry flow (source of truth)
+        $this->app->singleton(InquiryAiExtractor::class);
+        $this->app->singleton(InquiryAccommodationMatcher::class);
+        $this->app->singleton(InquiryOfferDraftBuilder::class);
     }
 
-    /**
-     * Bootstrap any application services.
-     */
     public function boot(): void
     {
         //

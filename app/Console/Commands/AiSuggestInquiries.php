@@ -2,28 +2,27 @@
 
 namespace App\Console\Commands;
 
+use App\Models\AiInquiry;
+use App\Models\Inquiry;
+use App\Services\InquiryAccommodationMatcher;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
-
-use App\Models\AiInquiry;
-use App\Models\Inquiry;
-use App\Services\Ai\SuggestionService;
 
 class AiSuggestInquiries extends Command
 {
     protected $signature = 'ai:suggest {--limit=50} {--force : Rebuild suggestions even if they exist}';
     protected $description = 'Generate hotel suggestions and store them on ai_inquiries.suggestions_payload';
 
-    public function handle(SuggestionService $sugg): int
+    public function handle(InquiryAccommodationMatcher $matcher): int
     {
         $limit = (int) $this->option('limit');
         $force = (bool) $this->option('force');
-        $statuses = ['parsed', 'needs_info', 'error'];
 
-        // ako je --force, dozvoli da ponovo gradi i one koji su ranije završili kao no_availability
+        $statuses = ['parsed', 'needs_info', 'error'];
         if ($force) {
             $statuses[] = 'no_availability';
+            $statuses[] = 'suggested';
         }
 
         $items = AiInquiry::query()
@@ -40,8 +39,10 @@ class AiSuggestInquiries extends Command
 
         foreach ($items as $ai) {
             try {
-                DB::transaction(function () use ($ai, $sugg, $force, &$processed, &$skipped) {
-                    $inquiry = Inquiry::find($ai->inquiry_id);
+                DB::transaction(function () use ($ai, $matcher, $force, &$processed, &$skipped) {
+
+                    /** @var Inquiry|null $inquiry */
+                    $inquiry = Inquiry::query()->find($ai->inquiry_id);
 
                     if (! $inquiry) {
                         $ai->status = 'error';
@@ -72,16 +73,13 @@ class AiSuggestInquiries extends Command
                         return;
                     }
 
-                    $parsed = $this->buildParsedFromInquiry($inquiry);
+                    // ✅ SOURCE OF TRUTH: matcher radi primary + alternatives + log
+                    $out = $matcher->matchWithAlternatives($inquiry, 5, 5);
 
-                    // ✅ NEW: primary + alternatives + log
-                    $out = $sugg->getWithAlternatives($parsed);
-
-                    $primary = $out['primary'] ?? [];
-                    $alts    = $out['alternatives'] ?? [];
+                    $primary = ($out['primary'] ?? collect())->values()->all();
+                    $alts    = ($out['alternatives'] ?? collect())->values()->all();
                     $log     = $out['log'] ?? [];
 
-                    // payload: uvek čuvamo top 5 primary i top 5 alternatives + log
                     $ai->suggestions_payload = [
                         'primary'      => array_slice($primary, 0, 5),
                         'alternatives' => array_slice($alts, 0, 5),
@@ -89,7 +87,6 @@ class AiSuggestInquiries extends Command
                     ];
                     $ai->suggested_at = Carbon::now();
 
-                    // Business: ako imamo bilo šta (primary ili alt) -> suggested
                     $hasAny = (count($primary) > 0) || (count($alts) > 0);
 
                     if ($hasAny) {
@@ -98,18 +95,15 @@ class AiSuggestInquiries extends Command
                         $inquiry->save();
 
                         $ai->status = 'suggested';
+                        $ai->missing_fields = null;
                     } else {
-                        // Nema ni primary ni alternative po standardima
+                        // nema ni primary ni alternative
                         if ($inquiry->status === 'new') {
                             $inquiry->status = 'extracted';
                             $inquiry->save();
                         }
 
                         $ai->status = 'no_availability';
-                    }
-
-                    // očisti error/missing ako je ranije bio error
-                    if ($ai->status !== 'error') {
                         $ai->missing_fields = null;
                     }
 
@@ -136,34 +130,5 @@ class AiSuggestInquiries extends Command
 
         $this->info("Done. Suggested: {$processed}, Skipped: {$skipped}, Failed: {$failed}");
         return self::SUCCESS;
-    }
-
-    private function buildParsedFromInquiry(Inquiry $inquiry): array
-    {
-        $childrenCount = (int) ($inquiry->children ?? 0);
-
-        $children = [];
-        $ages = [];
-
-        if (! empty($inquiry->children_ages)) {
-            $decoded = json_decode($inquiry->children_ages, true);
-            if (is_array($decoded)) {
-                $ages = array_values($decoded);
-            }
-        }
-
-        if ($childrenCount > 0) {
-            for ($i = 0; $i < $childrenCount; $i++) {
-                $children[] = ['age' => $ages[$i] ?? null];
-            }
-        }
-
-        return [
-            'region'           => $inquiry->region,
-            'location'         => $inquiry->location,
-            'adults'           => $inquiry->adults ?? 2,
-            'children'         => $children,
-            'budget_per_night' => $inquiry->budget_max ? (float) $inquiry->budget_max : null,
-        ];
     }
 }

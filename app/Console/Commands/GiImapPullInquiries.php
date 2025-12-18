@@ -3,7 +3,9 @@
 namespace App\Console\Commands;
 
 use App\Models\Inquiry;
+use Carbon\Carbon;
 use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Webklex\IMAP\Facades\Client;
 
@@ -14,7 +16,12 @@ class GiImapPullInquiries extends Command
 
     public function handle(): int
     {
-        $limit = (int) $this->option('limit');
+        $limit = max(1, (int) $this->option('limit'));
+
+        if (empty(env('IMAP_HOST'))) {
+            $this->error('IMAP_HOST is empty in .env.');
+            return self::FAILURE;
+        }
 
         $inboxes = [
             'booking' => [
@@ -30,11 +37,6 @@ class GiImapPullInquiries extends Command
         foreach ($inboxes as $key => $creds) {
             $this->line("== Inbox: {$key} ==");
 
-            if (empty(env('IMAP_HOST'))) {
-                $this->error('IMAP_HOST is empty in .env.');
-                continue;
-            }
-
             if (empty($creds['username']) || empty($creds['password'])) {
                 $this->warn("Missing credentials for {$key} (username/password). Skipping.");
                 continue;
@@ -43,12 +45,16 @@ class GiImapPullInquiries extends Command
             try {
                 $this->pullFromInbox(
                     inboxKey: $key,
-                    username: $creds['username'],
-                    password: $creds['password'],
+                    username: (string) $creds['username'],
+                    password: (string) $creds['password'],
                     limit: $limit
                 );
             } catch (\Throwable $e) {
                 $this->error("IMAP error for {$key}: " . $e->getMessage());
+                Log::warning('GiImapPullInquiries: inbox error', [
+                    'inbox' => $key,
+                    'message' => $e->getMessage(),
+                ]);
             }
         }
 
@@ -69,76 +75,172 @@ class GiImapPullInquiries extends Command
 
         $client->connect();
 
-        $folder = $client->getFolder('INBOX');
+        $folderName = env('AI_IMAP_MAILBOX', 'INBOX') ?: 'INBOX';
+        $folder = $client->getFolder($folderName);
 
-        $messages = $folder->query()
-            ->unseen()
+        $lookbackDays = (int) env('AI_IMAP_LOOKBACK_DAYS', 7);
+        $lookbackDays = $lookbackDays > 0 ? $lookbackDays : 7;
+        $since = now()->subDays($lookbackDays);
+
+        $query = $folder->query()->unseen();
+
+        // Ako verzija podržava since(), super, ali i dalje imamo ručni cutoff u foreach-u.
+        if (method_exists($query, 'since')) {
+            try {
+                $query->since($since);
+            } catch (\Throwable) {
+                // ignore, ručni cutoff je svakako tu
+            }
+        }
+
+        $messages = $query
             ->limit($limit)
             ->get();
 
         $count = 0;
 
         foreach ($messages as $message) {
-            $subject = (string) ($message->getSubject() ?? '');
+            // ----- Received at (moramo GA PRVO, da možemo da presečemo stare unseen) -----
+            $receivedAt = null;
+            try {
+                $date = $message->getDate();
+                if ($date) {
+                    $receivedAt = Carbon::parse($date);
+                }
+            } catch (\Throwable) {
+                $receivedAt = null;
+            }
 
+            // ako ne možemo da parsiramo datum, tretiraj kao "sad" (da ne baciš novi mejl)
+            $receivedAt = $receivedAt ?: now();
+
+            // ✅ Lookback cutoff: ako je mejl stariji od lookback prozora -> samo Seen i preskoči
+            if ($receivedAt->lt($since)) {
+                Log::info('GiImapPullInquiries: skipped old unseen', [
+                    'inbox' => $inboxKey,
+                    'folder' => $folderName,
+                    'received_at' => $receivedAt->toDateTimeString(),
+                    'since' => $since->toDateTimeString(),
+                ]);
+
+                $message->setFlag('Seen');
+                continue;
+            }
+
+            // ----- Subject -----
+            $subjectRaw = (string) ($message->getSubject() ?? '');
+            $subjectTrim = trim($subjectRaw);
+            $subjectNorm = $this->normalizeSubject($subjectTrim);
+
+            // ----- From -----
             $from = $message->getFrom();
             $fromEmail = (string) (($from[0]->mail ?? '') ?: '');
 
+            // ----- Headers -----
             $headers = $message->getHeader();
             $messageId  = (string) (($headers->get('message-id')[0] ?? '') ?: '');
             $inReplyTo  = (string) (($headers->get('in-reply-to')[0] ?? '') ?: '');
             $references = (string) (($headers->get('references')[0] ?? '') ?: '');
 
             // 1) Ignoriši follow-up (reply/forward)
-            if (!empty($inReplyTo) || !empty($references) || preg_match('/^(re:|fw:|fwd:)/i', trim($subject))) {
+            if (
+                ! empty($inReplyTo) ||
+                ! empty($references) ||
+                preg_match('/^(re:|fw:|fwd:)\s*/i', $subjectNorm)
+            ) {
+                Log::info('GiImapPullInquiries: ignored follow-up', [
+                    'inbox' => $inboxKey,
+                    'folder' => $folderName,
+                    'from' => $fromEmail,
+                    'subject' => $subjectTrim,
+                    'subject_norm' => $subjectNorm,
+                    'message_id' => $messageId,
+                    'in_reply_to' => $inReplyTo,
+                    'references' => $references,
+                ]);
+
                 $message->setFlag('Seen');
                 continue;
             }
 
             // 2) Ignoriši sistemske “Request from …” (po dogovoru)
-            if (Str::contains(Str::lower($subject), 'request from')) {
+            if (str_contains($subjectNorm, 'request from')) {
+                Log::info('GiImapPullInquiries: ignored request-from', [
+                    'inbox' => $inboxKey,
+                    'folder' => $folderName,
+                    'from' => $fromEmail,
+                    'subject' => $subjectTrim,
+                    'subject_norm' => $subjectNorm,
+                    'message_id' => $messageId,
+                ]);
+
                 $message->setFlag('Seen');
                 continue;
             }
 
-            // 3) Anti-duplicate (message-id)
-            if (!empty($messageId) && Inquiry::query()->where('external_id', $messageId)->exists()) {
-                $message->setFlag('Seen');
-                continue;
-            }
-
-            // Body: prefer text, fallback html (ne stripujemo da ne izgubimo bitno)
+            // ----- Body -----
             $body = (string) ($message->getTextBody() ?: $message->getHTMLBody() ?: '');
             $body = trim($body) !== '' ? trim($body) : '[EMPTY_BODY]';
 
-            // received_at iz mejla (fallback now)
-            $receivedAt = null;
-            try {
-                $date = $message->getDate();
-                if ($date) {
-                    $receivedAt = \Carbon\Carbon::parse($date);
-                }
-            } catch (\Throwable $e) {
-                $receivedAt = now();
+            // 3) Anti-duplicate: message-id ili hash (ako message-id fali)
+            $externalId = $messageId !== '' ? $messageId : null;
+
+            $hashSeed = implode('|', [
+                strtolower(trim($fromEmail)),
+                $subjectNorm,
+                (string) $receivedAt->toIso8601String(),
+                Str::of($body)->squish()->limit(5000),
+            ]);
+            $hash = hash('sha256', $hashSeed);
+
+            // ✅ Dedupe: proveri ono što ćeš snimiti u external_id
+            $externalToStore = $externalId ?: $hash;
+
+            $exists = Inquiry::query()
+                ->where('external_id', $externalToStore)
+                ->exists();
+
+            if ($exists) {
+                $message->setFlag('Seen');
+                continue;
             }
 
+            // Upis
             Inquiry::create([
                 'source'      => "email:{$inboxKey}",
-                'external_id' => $messageId ?: null,
+                'external_id' => $externalToStore,
 
                 'guest_email' => $fromEmail ?: null,
-                'subject'     => $subject ?: null,
+                'subject'     => $subjectTrim !== '' ? $subjectTrim : null,
                 'raw_message' => $body,
 
                 'status'      => 'new',
-                'received_at' => $receivedAt ?? now(),
+                'received_at' => $receivedAt,
             ]);
 
-            // Mark seen tek kad smo uspešno snimili
             $message->setFlag('Seen');
             $count++;
         }
 
         $this->info("Imported: {$count}");
+    }
+
+    private function normalizeSubject(string $subjectTrim): string
+    {
+        $subjectTrim = trim($subjectTrim);
+
+        $norm = mb_strtolower(preg_replace('/\s+/', ' ', $subjectTrim));
+
+        if (str_contains($subjectTrim, '=?')) {
+            $decoded = @iconv_mime_decode($subjectTrim, ICONV_MIME_DECODE_CONTINUE_ON_ERROR, 'UTF-8');
+            if (is_string($decoded) && trim($decoded) !== '') {
+                $norm = mb_strtolower(preg_replace('/\s+/', ' ', trim($decoded)));
+            }
+        }
+
+        // "re : test" -> "re:test"
+        $norm = preg_replace('/\s*:\s*/', ':', $norm);
+
+        return $norm ?: '';
     }
 }

@@ -9,25 +9,25 @@ class InquiryOfferDraftBuilder
 {
     public function build(Inquiry $inquiry, Collection $candidates): string
     {
-        $guest = $inquiry->guest_name ?: 'Poštovani';
+        $guest = trim((string) ($inquiry->guest_name ?? ''));
+        $salutation = $guest !== '' ? "Poštovani {$guest}," : "Poštovani,";
 
         $period = $this->formatPeriod($inquiry);
-        $pax = $this->formatPax($inquiry);
+        $pax    = $this->formatPax($inquiry);
 
         $lines = [];
 
-        $lines[] = "Poštovani,";
+        $lines[] = $salutation;
         $lines[] = "";
         $lines[] = "Hvala vam na javljanju i interesovanju za letovanje u Grčkoj.";
         $lines[] = "";
-        $lines[] = "Na osnovu informacija iz vašeg upita, u nastavku vam šaljemo nekoliko predloga smeštaja koji bi mogli da odgovaraju vašim željama. Ukoliko smo nešto pogrešno razumeli ili želite izmene, slobodno nas ispravite.";
+        $lines[] = "Na osnovu informacija iz vašeg upita, u nastavku vam šaljemo nekoliko predloga smeštaja. Ukoliko smo nešto pogrešno razumeli ili želite izmene, slobodno nas ispravite.";
         $lines[] = "";
 
-        // (opciono) kratki rezime - ako hoćeš da ga imaš uvek
         if ($period || $pax) {
             $summary = [];
             if ($period) $summary[] = "Period: {$period}";
-            if ($pax) $summary[] = "Osobe: {$pax}";
+            if ($pax)    $summary[] = "Osobe: {$pax}";
             $lines[] = implode(" • ", $summary);
             $lines[] = "";
         }
@@ -37,21 +37,25 @@ class InquiryOfferDraftBuilder
         foreach ($top as $idx => $c) {
             $n = $idx + 1;
 
-            $name = data_get($c, 'name') ?? data_get($c, 'title') ?? 'Smeštaj';
-            $location = data_get($c, 'location') ?? data_get($c, 'place') ?? $inquiry->location ?? null;
+            $name     = data_get($c, 'name') ?? data_get($c, 'title') ?? data_get($c, 'hotel.hotel_title') ?? 'Smeštaj';
+            $location = data_get($c, 'location') ?? data_get($c, 'place') ?? data_get($c, 'hotel.mesto') ?? ($inquiry->location ?? null);
 
-            $type = data_get($c, 'type') ?? data_get($c, 'unit_type') ?? null;
+            $type     = data_get($c, 'type') ?? data_get($c, 'unit_type') ?? data_get($c, 'room.room_title') ?? null;
             $capacity = data_get($c, 'capacity') ?? data_get($c, 'max_persons') ?? null;
 
-            // cena: pokušaj total za period; fallback na bilo koji price
-            $priceTotal = data_get($c, 'price_total') ?? data_get($c, 'total_price') ?? data_get($c, 'price') ?? null;
-            $priceText = $priceTotal ? $this->money($priceTotal) : null;
+            $priceTotal = data_get($c, 'price_total')
+                ?? data_get($c, 'total_price')
+                ?? data_get($c, 'price.total')
+                ?? data_get($c, 'price')
+                ?? null;
 
-            $nights = $inquiry->nights ?: data_get($c, 'nights');
-            $beach = data_get($c, 'beach_distance') ?? data_get($c, 'distance_to_beach') ?? null;
+            $priceText = $priceTotal !== null ? $this->money($priceTotal) : null;
+
+            $nights = $inquiry->nights ?: data_get($c, 'price.nights') ?: data_get($c, 'nights');
+            $beach  = data_get($c, 'beach_distance') ?? data_get($c, 'distance_to_beach') ?? data_get($c, 'hotel.plaza_udaljenost') ?? null;
             $beachText = $beach ? $this->formatBeach($beach) : null;
 
-            $url = data_get($c, 'url') ?? data_get($c, 'link') ?? data_get($c, 'website_url') ?? null;
+            $url = data_get($c, 'url') ?? data_get($c, 'link') ?? data_get($c, 'website_url') ?? data_get($c, 'hotel.url') ?? null;
             if ($url && ! str_starts_with($url, 'http')) {
                 $url = 'https://' . ltrim($url, '/');
             }
@@ -84,7 +88,6 @@ class InquiryOfferDraftBuilder
         $lines[] = "GrckaInfo tim";
         $lines[] = "https://grckainfo.com";
 
-        // Filament markdown TextEntry voli plain text sa \n
         return implode("\n", $lines);
     }
 
@@ -95,7 +98,7 @@ class InquiryOfferDraftBuilder
         }
 
         if ($i->month_hint) {
-            return $i->month_hint;
+            return (string) $i->month_hint;
         }
 
         return null;
@@ -107,15 +110,34 @@ class InquiryOfferDraftBuilder
         if ($i->adults) $parts[] = $i->adults . " odraslih";
         if (is_int($i->children) && $i->children > 0) $parts[] = $i->children . " dece";
 
-        if (empty($parts)) return null;
-
-        return implode(", ", $parts);
+        return empty($parts) ? null : implode(", ", $parts);
     }
 
     private function money($value): string
     {
-        $n = (int) preg_replace('/\D+/', '', (string) $value);
-        return number_format($n, 0, ',', '.') . " €";
+        // prihvata: "1250", "1.250", "1 250", "1.250,00", "1250.00"
+        $s = trim((string) $value);
+
+        // izbaci valute i sve osim cifara, tačke, zareza i razmaka
+        $s = preg_replace('/[^\d\.\,\s]/u', '', $s);
+
+        // ako ima i "," i ".", pretpostavi da je "." hiljade a "," decimale (EU format)
+        // npr "1.250,00" -> "1250.00"
+        if (str_contains($s, ',') && str_contains($s, '.')) {
+            $s = str_replace('.', '', $s);
+            $s = str_replace(',', '.', $s);
+        } else {
+            // ako ima samo ",", tretiraj kao decimalni separator
+            if (str_contains($s, ',')) {
+                $s = str_replace(',', '.', $s);
+            }
+            // izbaci razmake (hiljade)
+            $s = str_replace(' ', '', $s);
+        }
+
+        $amount = (float) $s;
+
+        return number_format((float) round($amount), 0, ',', '.') . " €";
     }
 
     private function formatBeach($distance): string

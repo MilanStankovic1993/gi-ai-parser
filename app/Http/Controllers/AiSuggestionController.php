@@ -4,18 +4,16 @@ namespace App\Http\Controllers;
 
 use App\Models\Grcka\Hotel;
 use Illuminate\Http\Request;
-use Illuminate\Support\Arr;
 use Illuminate\Support\Str;
 
 class AiSuggestionController extends Controller
 {
     public function find(Request $request)
     {
-        // 1) Ovo odgovara strukturi iz parsed inquirya
         $data = $request->validate([
             'region'           => 'nullable|string',
             'location'         => 'nullable|string',
-            'check_in'         => 'nullable|string', // kasnije može biti date
+            'check_in'         => 'nullable|string', // trenutno ne koristimo u ovom controlleru
             'nights'           => 'nullable|integer',
             'adults'           => 'nullable|integer|min:0',
             'children'         => 'nullable|array',  // npr: [ ["age" => 5], ... ]
@@ -32,20 +30,21 @@ class AiSuggestionController extends Controller
         $childrenCount = is_array($childrenArray) ? count($childrenArray) : 0;
 
         $totalPersons = 0;
-        if (! is_null($adults)) {
+        if ($adults !== null) {
             $totalPersons += (int) $adults;
         }
         $totalPersons += (int) $childrenCount;
 
         $budgetPerNight = array_key_exists('budget_per_night', $data) ? $data['budget_per_night'] : null;
 
-        $wants = array_values(array_filter(array_map(
-            fn ($v) => is_string($v) ? trim($v) : null,
-            $data['wants'] ?? []
-        )));
+        // wants normalizacija: prihvati ili ["parking","wifi"] ili [" parking ", ...]
+        $wantsRaw = $data['wants'] ?? [];
+        $wants = array_values(array_unique(array_filter(array_map(function ($v) {
+            if (! is_string($v)) return null;
+            $v = trim($v);
+            return $v !== '' ? $v : null;
+        }, is_array($wantsRaw) ? $wantsRaw : []))));
 
-        // map wants flags na "keywords" i/ili amenity ids (ako koristiš kodove)
-        // Ovo je heuristika - proširi po tvojoj bazi.
         $wantMatchers = $this->wantMatchers();
 
         $query = Hotel::query()
@@ -54,7 +53,8 @@ class AiSuggestionController extends Controller
             ->with([
                 'rooms',
                 'location:id,location,region_id',
-                'location.region:region_id,region_name',
+                // uzmi oba moguća polja, da ne puca
+                'location.region:region_id,region,region_name',
             ]);
 
         // ==========================================================
@@ -65,33 +65,31 @@ class AiSuggestionController extends Controller
                 $q->where('location', 'LIKE', '%' . $locationSearch . '%');
             });
         } elseif (! empty($regionSearch)) {
+            // region filter: pokušaj region_name ili region
             $query->whereHas('location.region', function ($q) use ($regionSearch) {
-                $q->where('region_name', 'LIKE', '%' . $regionSearch . '%');
+                $q->where(function ($qq) use ($regionSearch) {
+                    $qq->where('region_name', 'LIKE', '%' . $regionSearch . '%')
+                       ->orWhere('region', 'LIKE', '%' . $regionSearch . '%');
+                });
             });
         }
 
         // ==========================================================
-        // 3) Room-level filter (SQL) – da ne vučeš previše
-        //    (Budžet + kapacitet) ako je moguće.
+        // 3) Room-level filter (SQL)
         // ==========================================================
-        if (! is_null($budgetPerNight) || $totalPersons > 0 || ! is_null($adults)) {
+        if ($budgetPerNight !== null || $totalPersons > 0 || $adults !== null) {
             $query->whereHas('rooms', function ($q) use ($budgetPerNight, $adults, $childrenCount, $totalPersons) {
 
-                if (! is_null($budgetPerNight)) {
+                if ($budgetPerNight !== null) {
                     $q->whereNotNull('room_basic_price')
                       ->where('room_basic_price', '<=', $budgetPerNight);
                 }
 
-                // kapacitet – samo ako imamo neke osobe
-                if (! is_null($adults) || $childrenCount > 0) {
-
-                    // minimalno: room_adults >= adults (ako adults poznat)
-                    if (! is_null($adults)) {
+                if ($adults !== null || $childrenCount > 0) {
+                    if ($adults !== null) {
                         $q->where('room_adults', '>=', (int) $adults);
                     }
 
-                    // ukupno mesta: room_adults + room_children >= totalPersons
-                    // (SQL raw, jer je zbir kolona)
                     if ($totalPersons > 0) {
                         $q->whereRaw('(COALESCE(room_adults,0) + COALESCE(room_children,0)) >= ?', [(int) $totalPersons]);
                     }
@@ -103,7 +101,7 @@ class AiSuggestionController extends Controller
         // 4) Dohvati
         // ==========================================================
         $hotels = $query
-            ->limit(80) // malo veći limit, pa posle sečemo + score/sort
+            ->limit(80)
             ->get([
                 'hotel_id',
                 'hotel_title',
@@ -115,7 +113,7 @@ class AiSuggestionController extends Controller
             ]);
 
         // ==========================================================
-        // 5) Finalno filtriranje soba + wants matching + scoring
+        // 5) Final filtering + wants + scoring
         // ==========================================================
         $filtered = $hotels->map(function (Hotel $hotel) use (
             $locationSearch,
@@ -128,17 +126,21 @@ class AiSuggestionController extends Controller
             $wantMatchers
         ) {
             $hotelLocationName = optional($hotel->location)->location;
-            $hotelRegionName   = optional(optional($hotel->location)->region)->region_name;
 
-            // ----- room filtering (PHP final) -----
+            $hotelRegionName =
+                optional(optional($hotel->location)->region)->region_name
+                ?? optional(optional($hotel->location)->region)->region
+                ?? null;
+
+            $label = $hotel->location_label; // accessor iz modela (fallback)
+
             $rooms = $hotel->rooms->filter(function ($room) use ($adults, $childrenCount, $totalPersons, $budgetPerNight) {
-
                 // Kapacitet
-                if (! is_null($adults) || $childrenCount > 0) {
+                if ($adults !== null || $childrenCount > 0) {
                     $roomAdults   = (int) ($room->room_adults ?? 0);
                     $roomChildren = (int) ($room->room_children ?? 0);
 
-                    if (! is_null($adults) && $roomAdults < (int) $adults) {
+                    if ($adults !== null && $roomAdults < (int) $adults) {
                         return false;
                     }
 
@@ -148,14 +150,10 @@ class AiSuggestionController extends Controller
                 }
 
                 // Budžet
-                if (! is_null($budgetPerNight)) {
+                if ($budgetPerNight !== null) {
                     $price = $room->room_basic_price;
-                    if (is_null($price)) {
-                        return false;
-                    }
-                    if ((float) $price > (float) $budgetPerNight) {
-                        return false;
-                    }
+                    if ($price === null) return false;
+                    if ((float) $price > (float) $budgetPerNight) return false;
                 }
 
                 return true;
@@ -165,7 +163,6 @@ class AiSuggestionController extends Controller
                 return null;
             }
 
-            // ----- scoring -----
             $score = 0;
 
             // location match boost
@@ -182,29 +179,25 @@ class AiSuggestionController extends Controller
                 }
             }
 
-            // wants match: proveravamo po sobama (amenities + title)
+            // wants match
             $wantsMatched = [];
             foreach ($wants as $want) {
                 $matcher = $wantMatchers[$want] ?? null;
-                if (! $matcher) {
-                    continue;
-                }
+                if (! $matcher) continue;
 
                 $matched = $rooms->contains(function ($room) use ($matcher) {
                     $title = mb_strtolower((string) ($room->room_title ?? ''));
-                    $amen = (string) ($room->room_amenities ?? ''); // može biti CSV ili null
-                    $amenLower = mb_strtolower($amen);
+                    $amenLower = mb_strtolower((string) ($room->room_amenities ?? ''));
 
-                    // keyword match
                     foreach (($matcher['keywords'] ?? []) as $kw) {
+                        $kw = mb_strtolower((string) $kw);
                         if ($kw !== '' && Str::contains($title, $kw)) {
                             return true;
                         }
                     }
 
-                    // amenity code match (ako koristiš kodove u CSV stringu)
                     foreach (($matcher['amenity_ids'] ?? []) as $id) {
-                        $id = (string) $id;
+                        $id = mb_strtolower((string) $id);
                         if ($id !== '' && Str::contains($amenLower, $id)) {
                             return true;
                         }
@@ -220,18 +213,17 @@ class AiSuggestionController extends Controller
 
             $score += count($wantsMatched) * 7;
 
-            // cene: preferiraj niže (blagi boost ako ima basic_price)
-            if (! is_null($hotel->hotel_basic_price)) {
+            if ($hotel->hotel_basic_price !== null) {
                 $score += 1;
             }
 
-            // vrati hotel + rooms
             return [
                 'hotel_id'          => $hotel->hotel_id,
                 'hotel_title'       => $hotel->hotel_title,
                 'hotel_city'        => $hotel->hotel_city,
-                'hotel_city_name'   => $hotelLocationName,
+                'hotel_city_name'   => $hotelLocationName ?? $label,
                 'hotel_region'      => $hotelRegionName,
+                'hotel_location_label' => $label,
                 'hotel_basic_price' => $hotel->hotel_basic_price,
                 'placen'            => $hotel->placen,
                 'valid2025'         => $hotel->valid2025,
@@ -258,18 +250,22 @@ class AiSuggestionController extends Controller
 
         // ==========================================================
         // 6) Sort + limit
-        //    - ai_order asc (tvoj prioritet)
-        //    - placen desc (plaćeni prvo)
-        //    - score desc (wants / match)
-        //    - najniža cena sobe asc (ako hoćeš)
+        //   BITNO: ai_order u tvom modelu je "10 najveći prioritet" => DESC
         // ==========================================================
         $sorted = $filtered->sort(function ($a, $b) {
+            // ai_order DESC (null na kraj)
+            $aoA = $a['ai_order'];
+            $aoB = $b['ai_order'];
 
-            // ai_order (null na kraj)
-            $aoA = $a['ai_order'] ?? PHP_INT_MAX;
-            $aoB = $b['ai_order'] ?? PHP_INT_MAX;
-            if ($aoA !== $aoB) {
-                return $aoA <=> $aoB;
+            $aNull = ($aoA === null);
+            $bNull = ($aoB === null);
+
+            if ($aNull !== $bNull) {
+                return $aNull ? 1 : -1; // null ide na kraj
+            }
+
+            if (! $aNull && ! $bNull && (int) $aoA !== (int) $aoB) {
+                return (int) $aoB <=> (int) $aoA; // DESC
             }
 
             // placen desc
@@ -286,7 +282,7 @@ class AiSuggestionController extends Controller
                 return $sB <=> $sA;
             }
 
-            // najniža soba cena asc (fallback)
+            // najniža soba cena asc
             $minA = $this->minRoomPrice($a['rooms'] ?? []);
             $minB = $this->minRoomPrice($b['rooms'] ?? []);
             return $minA <=> $minB;
@@ -296,7 +292,7 @@ class AiSuggestionController extends Controller
             'filters' => $data,
             'count'   => $sorted->count(),
             'results' => $sorted,
-        ]);
+        ], 200, [], JSON_UNESCAPED_UNICODE);
     }
 
     protected function minRoomPrice(array $rooms): float
@@ -304,17 +300,14 @@ class AiSuggestionController extends Controller
         $prices = [];
         foreach ($rooms as $r) {
             $p = $r['room_basic_price'] ?? null;
-            if (! is_null($p)) {
+            if ($p !== null) {
                 $prices[] = (float) $p;
             }
         }
-        return empty($prices) ? 9999999 : min($prices);
+
+        return empty($prices) ? 9999999.0 : min($prices);
     }
 
-    /**
-     * wants -> heuristički match (keywords u room_title + (opciono) amenity ids u room_amenities CSV)
-     * Proširi po tvojoj šemi.
-     */
     protected function wantMatchers(): array
     {
         return [

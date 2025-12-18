@@ -2,10 +2,10 @@
 
 namespace App\Console\Commands;
 
-use Illuminate\Console\Command;
-use Illuminate\Support\Str;
 use App\Ai\Email\EmailInboxProviderInterface;
 use App\Models\AiInquiry;
+use Illuminate\Console\Command;
+use Illuminate\Support\Str;
 
 class AiIngestLocalEmails extends Command
 {

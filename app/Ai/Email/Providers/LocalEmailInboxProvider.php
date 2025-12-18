@@ -20,15 +20,18 @@ class LocalEmailInboxProvider implements EmailInboxProviderInterface
             @mkdir($processedPath, 0775, true);
         }
 
-        $files = glob(rtrim($basePath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . '*.{eml,txt}', GLOB_BRACE) ?: [];
+        $pattern = rtrim($basePath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . '*.{eml,txt}';
+        $files = glob($pattern, GLOB_BRACE) ?: [];
 
-        // Sort po vremenu (stari prvo) da bude predvidivo
-        usort($files, fn ($a, $b) => filemtime($a) <=> filemtime($b));
+        usort($files, function ($a, $b) {
+            $ta = @filemtime($a) ?: 0;
+            $tb = @filemtime($b) ?: 0;
+            return $ta <=> $tb;
+        });
 
         $messages = [];
 
         foreach ($files as $file) {
-            // preskoči sve što je u _processed folderu (glob ne bi trebalo, ali da smo mirni)
             if (Str::contains($file, DIRECTORY_SEPARATOR . '_processed' . DIRECTORY_SEPARATOR)) {
                 continue;
             }
@@ -46,8 +49,9 @@ class LocalEmailInboxProvider implements EmailInboxProviderInterface
             $date      = $headers['date'] ?? null;
             $messageId = $headers['message-id'] ?? null;
 
-            $fromEmail = $this->extractEmail($from);
-            $receivedAt = $this->parseDateToIso($date) ?? Carbon::createFromTimestamp(filemtime($file))->toIso8601String();
+            $fromEmail  = $this->extractEmail($from);
+            $fallbackAt = Carbon::createFromTimestamp((int) (@filemtime($file) ?: time()))->toIso8601String();
+            $receivedAt = $this->parseDateToIso($date) ?? $fallbackAt;
 
             $messages[] = [
                 'message_id'   => $messageId,
@@ -66,8 +70,6 @@ class LocalEmailInboxProvider implements EmailInboxProviderInterface
 
     private function parseEmlLike(string $raw): array
     {
-        // Standardni EML: headeri pa prazna linija pa body.
-        // Normalizujemo line endings.
         $raw = str_replace(["\r\n", "\r"], "\n", $raw);
 
         $parts = preg_split("/\n\s*\n/", $raw, 2);
@@ -76,24 +78,21 @@ class LocalEmailInboxProvider implements EmailInboxProviderInterface
 
         $headers = $this->parseHeaders($headerText);
 
-        // Ako je .txt bez headera, tretiramo sve kao body
         if ($headers === []) {
             $body = $raw;
         }
 
-        return [$headers, trim($body)];
+        return [$headers, trim((string) $body)];
     }
 
     private function parseHeaders(string $headerText): array
     {
         $lines = explode("\n", $headerText);
 
-        // Folded headers: linije koje počinju space/tab pripadaju prethodnom headeru
         $unfolded = [];
         foreach ($lines as $line) {
-            if ($line === '') {
-                continue;
-            }
+            if ($line === '') continue;
+
             if (! empty($unfolded) && preg_match('/^[ \t]+/', $line)) {
                 $unfolded[count($unfolded) - 1] .= ' ' . trim($line);
             } else {
@@ -104,14 +103,11 @@ class LocalEmailInboxProvider implements EmailInboxProviderInterface
         $headers = [];
         foreach ($unfolded as $line) {
             $pos = strpos($line, ':');
-            if ($pos === false) {
-                continue;
-            }
+            if ($pos === false) continue;
 
             $key = strtolower(trim(substr($line, 0, $pos)));
             $value = trim(substr($line, $pos + 1));
 
-            // Zadržimo samo prve vrednosti; ako treba multi-value kasnije, proširićemo.
             if (! array_key_exists($key, $headers)) {
                 $headers[$key] = $value;
             }
@@ -122,11 +118,8 @@ class LocalEmailInboxProvider implements EmailInboxProviderInterface
 
     private function extractEmail(?string $fromHeader): ?string
     {
-        if (! $fromHeader) {
-            return null;
-        }
+        if (! $fromHeader) return null;
 
-        // hvata mail iz "Name <mail@domain>" ili samo "mail@domain"
         if (preg_match('/<([^>]+@[^>]+)>/', $fromHeader, $m)) {
             return strtolower(trim($m[1]));
         }
@@ -139,13 +132,11 @@ class LocalEmailInboxProvider implements EmailInboxProviderInterface
 
     private function parseDateToIso(?string $dateHeader): ?string
     {
-        if (! $dateHeader) {
-            return null;
-        }
+        if (! $dateHeader) return null;
 
         try {
             return Carbon::parse($dateHeader)->toIso8601String();
-        } catch (\Throwable $e) {
+        } catch (\Throwable) {
             return null;
         }
     }
@@ -154,7 +145,6 @@ class LocalEmailInboxProvider implements EmailInboxProviderInterface
     {
         $baseName = basename($file);
 
-        // da izbegnemo overwrite: dodamo timestamp prefiks ako već postoji
         $target = rtrim($processedPath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $baseName;
         if (file_exists($target)) {
             $target = rtrim($processedPath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . time() . '_' . $baseName;
