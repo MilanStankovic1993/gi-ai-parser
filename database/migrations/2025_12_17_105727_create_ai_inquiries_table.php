@@ -11,24 +11,24 @@ return new class extends Migration
         Schema::create('ai_inquiries', function (Blueprint $table) {
             $table->id();
 
-            $table->string('source')->default('local'); // local|imap|manual
-            $table->string('message_id')->nullable();
-            $table->string('message_hash')->unique();   // dedupe ključ
+            $table->string('source', 50)->default('local'); // local|imap|manual
+            $table->string('message_id', 255)->nullable()->index();
+            $table->string('message_hash', 255)->unique();   // dedupe ključ
 
-            $table->string('from_email')->nullable();
-            $table->string('subject')->nullable();
+            $table->string('from_email', 255)->nullable();
+            $table->string('subject', 255)->nullable();
             $table->timestamp('received_at')->nullable();
 
             $table->json('headers')->nullable();
             $table->longText('raw_body')->nullable();
 
             // Pipeline status (string da ne puca kad dodaš nove statuse)
-            // npr: new|synced|parsed|needs_info|suggested|no_availability|drafted|done|error|stopped
-            $table->string('status')->default('new');
+            $table->string('status', 50)->default('new');
             $table->boolean('ai_stopped')->default(false);
 
             // Veza ka poslovnom Inquiry
-            $table->unsignedBigInteger('inquiry_id')->nullable()->index();
+            $table->foreignId('inquiry_id')->nullable()->index()
+                ->constrained('inquiries')->nullOnDelete();
 
             // Parse meta
             $table->timestamp('parsed_at')->nullable();
@@ -43,8 +43,9 @@ return new class extends Migration
             $table->index(['status', 'received_at']);
             $table->index(['from_email']);
 
-            // (opciono) FK ako želiš (samo ako ti je ok cascade)
-            // $table->foreign('inquiry_id')->references('id')->on('inquiries')->nullOnDelete();
+            // praktični indexi za lookup/dedupe/debug
+            $table->index(['source', 'message_id']);
+            $table->index(['source', 'message_hash']);
         });
     }
 

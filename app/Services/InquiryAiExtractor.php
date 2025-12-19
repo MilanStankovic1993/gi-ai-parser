@@ -18,9 +18,19 @@ class InquiryAiExtractor
             return $this->fallbackExtract($inquiry);
         }
 
+        // AI toggle (radi i preko config i preko env)
         $aiEnabled =
             (bool) config('app.ai_enabled', false) ||
-            filter_var(env('AI_ENABLED', false), FILTER_VALIDATE_BOOL);
+            (string) env('AI_ENABLED', 'false') === 'true';
+
+        Log::info('AI toggle runtime', [
+            'ai_enabled'      => $aiEnabled,
+            'app_ai_enabled'  => config('app.ai_enabled'),
+            'env_ai_enabled'  => env('AI_ENABLED'),
+            'openai_key_set'  => (bool) config('services.openai.key'),
+            'openai_model'    => config('services.openai.model'),
+            'inquiry_id'      => $inquiry->id ?? null,
+        ]);
 
         if (! $aiEnabled) {
             return $this->fallbackExtract($inquiry);
@@ -33,7 +43,13 @@ class InquiryAiExtractor
             return $this->fallbackExtract($inquiry);
         }
 
-        $today = now()->toDateString();
+        // hard cap da ne šaljemo ogromne thread-ove / potpise
+        $textForAi = Str::of($text)->replace("\r", "\n")->squish()->limit(7000)->toString();
+
+        // koristimo received_at (ako postoji) kao "danas" – bitno za upite iz IMAP-a
+        $today = $inquiry->received_at
+            ? Carbon::parse($inquiry->received_at)->toDateString()
+            : now()->toDateString();
 
         $system = <<<SYS
 Ti si asistent za GrckaInfo. Iz jedne poruke gosta treba da izvučeš strukturisane parametre za ponudu smeštaja.
@@ -49,48 +65,48 @@ DATUMI:
 OSOBE:
 - adults: broj odraslih (int|null)
 - children: broj dece (int|null)
-- children_ages: niz uzrasta [5,3] ako je pomenuto, inače [] (prazan niz) ili null ako nema informacije.
+- children_ages: niz uzrasta [5,3] ako je pomenuto, inače [] (prazan niz). Ako nema informacije, vrati [].
 
 BUDŽET:
-- budget_min / budget_max kao int (EUR)
+- budget_min / budget_max kao int (EUR) ili null ako nije navedeno.
 
 LOKACIJA:
-- region: oblast/regija
-- location: mesto
+- region: oblast/regija (string|null)
+- location: mesto/naselje (string|null)
 
 ŽELJE:
 - wants_near_beach, wants_parking, wants_quiet, wants_pets, wants_pool kao true/false/null (null ako nije pomenuto)
 
 OSTALO:
-- special_requirements: kratak slobodan tekst
-- language: "sr" ili "en"
+- special_requirements: kratak slobodan tekst ili null
+- language: "sr" ili "en" (ili null ako nisi siguran)
 SYS;
 
         $user = <<<USR
 Danas je: {$today}
 
 PORUKA GOSTA:
-{$text}
+{$textForAi}
 
 Vrati JSON sa poljima:
-region (string|null),
-location (string|null),
-month_hint (string|null),
-date_from (string|null),
-date_to (string|null),
-nights (int|null),
-adults (int|null),
-children (int|null),
-children_ages (array|null),
-budget_min (int|null),
-budget_max (int|null),
-wants_near_beach (bool|null),
-wants_parking (bool|null),
-wants_quiet (bool|null),
-wants_pets (bool|null),
-wants_pool (bool|null),
-special_requirements (string|null),
-language (string|null)
+region,
+location,
+month_hint,
+date_from,
+date_to,
+nights,
+adults,
+children,
+children_ages,
+budget_min,
+budget_max,
+wants_near_beach,
+wants_parking,
+wants_quiet,
+wants_pets,
+wants_pool,
+special_requirements,
+language
 USR;
 
         try {
@@ -128,7 +144,47 @@ USR;
                 return $this->fallbackExtract($inquiry);
             }
 
-            $out = $this->normalize($json, $text);
+            $out = $this->normalizeAiOutput($json);
+
+            // deterministic checkout: date_to = date_from + nights ako fali
+            if ($out['date_from'] && $out['nights'] && ! $out['date_to']) {
+                try {
+                    $out['date_to'] = Carbon::parse($out['date_from'])
+                        ->addDays((int) $out['nights'])
+                        ->toDateString();
+                } catch (\Throwable) {
+                    // ignore
+                }
+            }
+
+            // ✅ KLJUČ: ako je AI dao datum u prošlosti (u odnosu na primljeni upit), prebaci na sledeću godinu
+            [$df, $dt] = $this->normalizeFutureDates(
+                $out['date_from'],
+                $out['date_to'],
+                $out['nights'],
+                $inquiry->received_at ? Carbon::parse($inquiry->received_at) : null
+            );
+            $out['date_from'] = $df;
+            $out['date_to']   = $dt;
+
+            // minimalni SAFE fallback dopune (ne diramo ključne parametre)
+            if ($out['budget_min'] === null && $out['budget_max'] === null) {
+                $b = $this->extractBudgetFromText($text);
+                $out['budget_min'] = $b['budget_min'];
+                $out['budget_max'] = $b['budget_max'];
+            }
+
+            // wants: samo dopuni null-ove heuristikom
+            $fallbackWants = $this->extractWantsFromText($text);
+            foreach ($fallbackWants as $k => $v) {
+                if (array_key_exists($k, $out) && $out[$k] === null) {
+                    $out[$k] = $v;
+                }
+            }
+
+            // language fallback
+            $out['language'] = $out['language'] ?: $this->guessLanguage($text);
+
             $out['_mode'] = 'ai';
 
             return $out;
@@ -141,7 +197,50 @@ USR;
         }
     }
 
-    private function normalize(array $data, string $rawText): array
+    /**
+     * Ako su datumi u prošlosti u odnosu na received_at (ili now), prebaci ih +1 godinu.
+     * Tolerancija: 7 dana.
+     */
+    private function normalizeFutureDates(?string $dateFrom, ?string $dateTo, ?int $nights, ?Carbon $receivedAt = null): array
+    {
+        if (! $dateFrom) {
+            return [$dateFrom, $dateTo];
+        }
+
+        try {
+            $from = Carbon::parse($dateFrom)->startOfDay();
+        } catch (\Throwable) {
+            return [null, null];
+        }
+
+        $to = null;
+        if ($dateTo) {
+            try {
+                $to = Carbon::parse($dateTo)->startOfDay();
+            } catch (\Throwable) {
+                $to = null;
+            }
+        }
+
+        $ref = ($receivedAt ?: now())->startOfDay();
+
+        // ako je "from" dovoljno u prošlosti, shift +1 godinu
+        if ($from->lt($ref->copy()->subDays(7))) {
+            $from->addYear();
+            if ($to) {
+                $to->addYear();
+            } elseif ($nights) {
+                $to = $from->copy()->addDays((int) $nights);
+            }
+        }
+
+        return [$from->toDateString(), $to?->toDateString()];
+    }
+
+    /**
+     * Normalizuje strogo AI output (bez "izmišljanja" ključnih parametara).
+     */
+    private function normalizeAiOutput(array $data): array
     {
         $out = [
             'region' => $this->nullIfEmpty(data_get($data, 'region')),
@@ -155,7 +254,7 @@ USR;
             'adults' => $this->normalizeInt(data_get($data, 'adults')),
             'children' => $this->normalizeInt(data_get($data, 'children')),
 
-            'children_ages' => $this->normalizeAges(data_get($data, 'children_ages')),
+            'children_ages' => $this->normalizeAgesToArray(data_get($data, 'children_ages')),
 
             'budget_min' => $this->normalizeInt(data_get($data, 'budget_min')),
             'budget_max' => $this->normalizeInt(data_get($data, 'budget_max')),
@@ -167,41 +266,23 @@ USR;
             'wants_pool'       => $this->normalizeBool(data_get($data, 'wants_pool')),
 
             'special_requirements' => $this->nullIfEmpty(data_get($data, 'special_requirements')),
-            'language' => $this->nullIfEmpty(data_get($data, 'language')) ?? 'sr',
+            'language' => $this->nullIfEmpty(data_get($data, 'language')),
         ];
 
-        if (! $out['nights'] && $out['date_from'] && $out['date_to']) {
-            try {
-                $df = Carbon::parse($out['date_from']);
-                $dt = Carbon::parse($out['date_to']);
-                $n = $df->diffInDays($dt);
-                $out['nights'] = $n > 0 ? $n : null;
-            } catch (\Throwable $e) {}
-        }
+        // ako imamo tačne datume, month_hint čistimo (da nema konflikta)
+        if ($out['date_from'] && $out['date_to']) {
+            $out['month_hint'] = null;
 
-        if (! $out['budget_min'] && ! $out['budget_max']) {
-            $b = $this->extractBudgetFromText($rawText);
-            $out['budget_min'] = $b['budget_min'];
-            $out['budget_max'] = $b['budget_max'];
-        }
-
-        $fallbackWants = $this->extractWantsFromText($rawText);
-        foreach ($fallbackWants as $k => $v) {
-            if ($out[$k] === null) {
-                $out[$k] = $v;
+            if (! $out['nights']) {
+                try {
+                    $df = Carbon::parse($out['date_from']);
+                    $dt = Carbon::parse($out['date_to']);
+                    $n = $df->diffInDays($dt);
+                    $out['nights'] = $n > 0 ? $n : null;
+                } catch (\Throwable) {
+                    // ignore
+                }
             }
-        }
-
-        if (! $out['adults']) {
-            $out['adults'] = $this->extractAdultsFromText($rawText);
-        }
-        if ($out['children'] === null) {
-            $out['children'] = $this->extractChildrenCountFromText($rawText);
-        }
-
-        if ($out['children_ages'] === null) {
-            $ages = $this->extractChildrenAgesFromText($rawText);
-            $out['children_ages'] = ! empty($ages) ? $ages : null;
         }
 
         return $out;
@@ -255,9 +336,10 @@ USR;
     private function normalizeDate($v): ?string
     {
         if (! is_string($v) || trim($v) === '') return null;
+
         try {
             return Carbon::parse($v)->toDateString();
-        } catch (\Throwable $e) {
+        } catch (\Throwable) {
             return null;
         }
     }
@@ -269,9 +351,12 @@ USR;
         return $v === '' ? null : $v;
     }
 
-    private function normalizeAges($v): ?array
+    /**
+     * UVEK vraća array ([]) – nikad null.
+     */
+    private function normalizeAgesToArray($v): array
     {
-        if ($v === null) return null;
+        if ($v === null) return [];
 
         if (is_string($v)) {
             $decoded = json_decode($v, true);
@@ -283,7 +368,7 @@ USR;
             }
         }
 
-        if (! is_array($v)) return null;
+        if (! is_array($v)) return [];
 
         $ages = [];
         foreach ($v as $item) {
@@ -298,7 +383,7 @@ USR;
 
     private function parseMoneyInt(?string $s): ?int
     {
-        if (!is_string($s)) return null;
+        if (! is_string($s)) return null;
 
         $s = trim($s);
         if ($s === '') return null;
@@ -323,7 +408,7 @@ USR;
     }
 
     /**
-     * Fallback parser (heuristic) — produkcijski: radi i bez AI.
+     * Fallback parser (heuristic) — radi i bez AI.
      */
     private function fallbackExtract(Inquiry $inquiry): array
     {
@@ -337,7 +422,6 @@ USR;
         $childrenAges = $this->extractChildrenAgesFromText($text);
 
         [$dateFrom, $dateTo] = $this->extractDateRangeFromText($text);
-
         $monthHint = $this->extractMonthHint($text);
 
         $nights = null;
@@ -345,14 +429,38 @@ USR;
             try {
                 $n = Carbon::parse($dateFrom)->diffInDays(Carbon::parse($dateTo));
                 $nights = $n > 0 ? $n : null;
-            } catch (\Throwable $e) {}
+            } catch (\Throwable) {
+                // ignore
+            }
         } else {
             $nights = $this->extractNightsFromText($text);
         }
 
+        // deterministic: ako imamo date_from + nights, a nemamo date_to
+        if ($dateFrom && $nights && ! $dateTo) {
+            try {
+                $dateTo = Carbon::parse($dateFrom)->addDays((int) $nights)->toDateString();
+            } catch (\Throwable) {
+                // ignore
+            }
+        }
+
+        // ✅ shift na budućnost ako je upit primljen kasnije (ili now)
+        [$dateFrom, $dateTo] = $this->normalizeFutureDates(
+            $dateFrom,
+            $dateTo,
+            $nights,
+            $inquiry->received_at ? Carbon::parse($inquiry->received_at) : null
+        );
+
         $budget = $this->extractBudgetFromText($text);
         $wants = $this->extractWantsFromText($text);
         $special = $this->extractSpecialRequirementsText($text);
+
+        // ako imamo tačne datume, month_hint čistimo
+        if ($dateFrom && $dateTo) {
+            $monthHint = null;
+        }
 
         return [
             'region' => $region,
@@ -365,7 +473,7 @@ USR;
 
             'adults' => $adults,
             'children' => $childrenCount,
-            'children_ages' => !empty($childrenAges) ? $childrenAges : null,
+            'children_ages' => $childrenAges ?: [],
 
             'budget_min' => $budget['budget_min'],
             'budget_max' => $budget['budget_max'],
@@ -382,6 +490,10 @@ USR;
             '_mode' => 'fallback',
         ];
     }
+
+    // ------------------------------
+    // Helper metode (tvoj postojeći kod)
+    // ------------------------------
 
     private function extractLocationRegionFallback(string $t): array
     {
@@ -402,6 +514,8 @@ USR;
             'nikiti' => ['Nikiti', 'Halkidiki - Sithonia'],
             'toroni' => ['Toroni', 'Halkidiki - Sithonia'],
             'vourvourou' => ['Vourvourou', 'Halkidiki - Sithonia'],
+            // dodaj po potrebi
+            'jerisos' => ['Jerisos', 'Halkidiki - Athos'],
         ];
 
         foreach ($map as $needle => $lr) {
@@ -466,22 +580,16 @@ USR;
         return array_values(array_unique($ages));
     }
 
-    /**
-     * ✅ PRODUKCIJSKI: datumi bez godine -> sledeći realan termin u budućnosti.
-     * Podržava: "od 01.09. do 08.09.", "01.09-08.09", "01/09 do 08/09", sa/bez godine.
-     */
     private function extractDateRangeFromText(string $text): array
     {
         $t = mb_strtolower($text);
 
-        // 1) dd.mm.yyyy - dd.mm.yyyy (ili do)
         if (preg_match('/\b(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\b/u', $t, $m)) {
             $from = Carbon::createFromDate((int)$m[3], (int)$m[2], (int)$m[1])->startOfDay();
             $to   = Carbon::createFromDate((int)$m[6], (int)$m[5], (int)$m[4])->startOfDay();
             return [$from->toDateString(), $to->toDateString()];
         }
 
-        // 2) dd.mm.yyyy - dd.mm (isti year) (ređe)
         if (preg_match('/\b(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\b/u', $t, $m)) {
             $y = (int)$m[3];
             $from = Carbon::createFromDate($y, (int)$m[2], (int)$m[1])->startOfDay();
@@ -489,8 +597,6 @@ USR;
             return [$from->toDateString(), $to->toDateString()];
         }
 
-        // 3) dd.mm - dd.mm (bez godine) — NAJČEŠĆE kod vas
-        // prihvati i tačku posle meseca: 01.09. do 08.09.
         if (preg_match('/\b(?:od\s*)?(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*\.?\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*\.?\b/u', $t, $m)) {
             $d1 = (int)$m[1]; $mo1 = (int)$m[2];
             $d2 = (int)$m[3]; $mo2 = (int)$m[4];
@@ -498,7 +604,6 @@ USR;
             $from = $this->inferFutureDate($d1, $mo1);
             $to   = $this->inferFutureDate($d2, $mo2);
 
-            // ako end ispadne pre start (npr. 28.12 - 04.01), prebacimo end u sledeću godinu
             if ($to->lte($from)) {
                 $to = $to->copy()->addYear();
             }
@@ -509,15 +614,10 @@ USR;
         return [null, null];
     }
 
-    /**
-     * Vrati sledeći datum (d/m) koji je >= danas.
-     * Ako je već prošao u tekućoj godini -> prebaci u sledeću godinu.
-     */
     private function inferFutureDate(int $day, int $month): Carbon
     {
         $today = now()->startOfDay();
 
-        // invalid guard
         $month = max(1, min(12, $month));
         $day   = max(1, min(31, $day));
 
@@ -568,21 +668,15 @@ USR;
         return null;
     }
 
-    /**
-     * ✅ Budžet hvata SAMO ako postoji eur/€ ili reč "budžet"
-     * da se "od 01.09 do 08.09" ne protumači kao 1–8 EUR.
-     */
     private function extractBudgetFromText(string $text): array
     {
         $t = mb_strtolower($text);
 
         $hasBudgetContext = Str::contains($t, ['€', 'eur', 'eura', 'euro', 'budžet', 'budzet', 'budget']);
-
         if (! $hasBudgetContext) {
             return ['budget_min' => null, 'budget_max' => null];
         }
 
-        // od X do Y (mora da ima eur/€ ili "budžet" u blizini)
         if (preg_match('/\b(?:budžet|budzet|budget)?\s*(?:od)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\s*(?:do|\-)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
             return [
                 'budget_min' => $this->parseMoneyInt($m[1]),
@@ -590,7 +684,6 @@ USR;
             ];
         }
 
-        // od X do Y (ako piše budžet ... od X do Y, a valuta samo jednom)
         if (preg_match('/\b(?:budžet|budzet|budget)[^0-9]{0,40}od\s*([\d\.\,\s]{1,12})\s*(?:do|\-)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
             return [
                 'budget_min' => $this->parseMoneyInt($m[1]),
@@ -598,17 +691,14 @@ USR;
             ];
         }
 
-        // do X EUR
         if (preg_match('/\b(?:budžet|budzet|budget)?[^0-9]{0,40}\bdo\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
             return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
         }
 
-        // oko X EUR
         if (preg_match('/\b(?:budžet|budzet|budget)?[^0-9]{0,40}\boko\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
             return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
         }
 
-        // bilo gde X EUR, ali samo ako postoji "budžet" ili "budget" u poruci
         if (Str::contains($t, ['budžet', 'budzet', 'budget']) && preg_match('/\b([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
             return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
         }

@@ -2,7 +2,7 @@
 
 namespace App\Console\Commands;
 
-use App\Models\Inquiry;
+use App\Models\AiInquiry;
 use Carbon\Carbon;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
@@ -12,7 +12,7 @@ use Webklex\IMAP\Facades\Client;
 class GiImapPullInquiries extends Command
 {
     protected $signature = 'gi:imap-pull {--limit=50 : Max messages per inbox per run}';
-    protected $description = 'Pull new (first-contact) inquiries from IMAP inboxes into the app database';
+    protected $description = 'Pull first-contact inquiries from IMAP into ai_inquiries (dedupe via message_hash)';
 
     public function handle(): int
     {
@@ -71,6 +71,7 @@ class GiImapPullInquiries extends Command
             'username'      => $username,
             'password'      => $password,
             'protocol'      => 'imap',
+            'timeout'       => (int) env('IMAP_TIMEOUT', 30),
         ]);
 
         $client->connect();
@@ -78,29 +79,45 @@ class GiImapPullInquiries extends Command
         $folderName = env('AI_IMAP_MAILBOX', 'INBOX') ?: 'INBOX';
         $folder = $client->getFolder($folderName);
 
-        $lookbackDays = (int) env('AI_IMAP_LOOKBACK_DAYS', 7);
-        $lookbackDays = $lookbackDays > 0 ? $lookbackDays : 7;
+        $lookbackDays = max(1, (int) env('AI_IMAP_LOOKBACK_DAYS', 7));
         $since = now()->subDays($lookbackDays);
 
-        $query = $folder->query()->unseen();
+        // unseen (prod) / all (test)
+        $mode = strtolower((string) env('AI_IMAP_FETCH_MODE', 'unseen')); // unseen|all
 
-        // Ako verzija podržava since(), super, ali i dalje imamo ručni cutoff u foreach-u.
+        $query = $folder->query();
+
+        if ($mode === 'all') {
+            // Gmail/Webklex: mora eksplicitno all()
+            $query->all();
+        } else {
+            $query->unseen();
+        }
+
+        // newest first (ako postoji)
+        if (method_exists($query, 'setFetchOrder')) {
+            try {
+                $query->setFetchOrder('desc');
+            } catch (\Throwable) {
+            }
+        }
+
+        // since() ako postoji (i dalje imamo ručni cutoff)
         if (method_exists($query, 'since')) {
             try {
                 $query->since($since);
             } catch (\Throwable) {
-                // ignore, ručni cutoff je svakako tu
             }
         }
 
-        $messages = $query
-            ->limit($limit)
-            ->get();
+        $messages = $query->limit($limit)->get();
 
-        $count = 0;
+        $countNew = 0;
+        $countUpdated = 0;
+        $countSkipped = 0;
 
         foreach ($messages as $message) {
-            // ----- Received at (moramo GA PRVO, da možemo da presečemo stare unseen) -----
+            // ----- received_at (prvo zbog lookback)
             $receivedAt = null;
             try {
                 $date = $message->getDate();
@@ -110,119 +127,136 @@ class GiImapPullInquiries extends Command
             } catch (\Throwable) {
                 $receivedAt = null;
             }
-
-            // ako ne možemo da parsiramo datum, tretiraj kao "sad" (da ne baciš novi mejl)
             $receivedAt = $receivedAt ?: now();
 
-            // ✅ Lookback cutoff: ako je mejl stariji od lookback prozora -> samo Seen i preskoči
-            if ($receivedAt->lt($since)) {
-                Log::info('GiImapPullInquiries: skipped old unseen', [
-                    'inbox' => $inboxKey,
-                    'folder' => $folderName,
-                    'received_at' => $receivedAt->toDateTimeString(),
-                    'since' => $since->toDateTimeString(),
-                ]);
-
-                $message->setFlag('Seen');
-                continue;
-            }
-
-            // ----- Subject -----
+            // ----- subject (hard limit da ne pukne DB)
             $subjectRaw = (string) ($message->getSubject() ?? '');
             $subjectTrim = trim($subjectRaw);
+            if ($subjectTrim !== '') {
+                $subjectTrim = Str::of($subjectTrim)->limit(250, '…')->toString();
+            }
             $subjectNorm = $this->normalizeSubject($subjectTrim);
 
-            // ----- From -----
+            // ----- from
             $from = $message->getFrom();
             $fromEmail = (string) (($from[0]->mail ?? '') ?: '');
+            $fromLower = strtolower(trim($fromEmail));
 
-            // ----- Headers -----
-            $headers = $message->getHeader();
-            $messageId  = (string) (($headers->get('message-id')[0] ?? '') ?: '');
-            $inReplyTo  = (string) (($headers->get('in-reply-to')[0] ?? '') ?: '');
-            $references = (string) (($headers->get('references')[0] ?? '') ?: '');
+            // ----- headers
+            $headersObj = $message->getHeader();
+            $messageId  = (string) (($headersObj->get('message-id')[0] ?? '') ?: '');
+            $inReplyTo  = (string) (($headersObj->get('in-reply-to')[0] ?? '') ?: '');
+            $references = (string) (($headersObj->get('references')[0] ?? '') ?: '');
 
-            // 1) Ignoriši follow-up (reply/forward)
-            if (
-                ! empty($inReplyTo) ||
-                ! empty($references) ||
-                preg_match('/^(re:|fw:|fwd:)\s*/i', $subjectNorm)
-            ) {
-                Log::info('GiImapPullInquiries: ignored follow-up', [
-                    'inbox' => $inboxKey,
-                    'folder' => $folderName,
-                    'from' => $fromEmail,
-                    'subject' => $subjectTrim,
-                    'subject_norm' => $subjectNorm,
-                    'message_id' => $messageId,
-                    'in_reply_to' => $inReplyTo,
-                    'references' => $references,
-                ]);
-
-                $message->setFlag('Seen');
-                continue;
-            }
-
-            // 2) Ignoriši sistemske “Request from …” (po dogovoru)
-            if (str_contains($subjectNorm, 'request from')) {
-                Log::info('GiImapPullInquiries: ignored request-from', [
-                    'inbox' => $inboxKey,
-                    'folder' => $folderName,
-                    'from' => $fromEmail,
-                    'subject' => $subjectTrim,
-                    'subject_norm' => $subjectNorm,
-                    'message_id' => $messageId,
-                ]);
-
-                $message->setFlag('Seen');
-                continue;
-            }
-
-            // ----- Body -----
+            // ----- body
             $body = (string) ($message->getTextBody() ?: $message->getHTMLBody() ?: '');
             $body = trim($body) !== '' ? trim($body) : '[EMPTY_BODY]';
 
-            // 3) Anti-duplicate: message-id ili hash (ako message-id fali)
-            $externalId = $messageId !== '' ? $messageId : null;
+            $bodySquished = Str::of($body)->squish()->toString();
+            $bodyNorm = mb_strtolower($bodySquished);
 
-            $hashSeed = implode('|', [
-                strtolower(trim($fromEmail)),
+            // --- message_hash (dedupe stabilno)
+            $messageHash = hash('sha256', implode('|', [
+                'imap',
+                $inboxKey,
+                $messageId ?: '',
+                $fromLower,
                 $subjectNorm,
                 (string) $receivedAt->toIso8601String(),
-                Str::of($body)->squish()->limit(5000),
-            ]);
-            $hash = hash('sha256', $hashSeed);
+                Str::of($bodySquished)->limit(5000),
+            ]));
 
-            // ✅ Dedupe: proveri ono što ćeš snimiti u external_id
-            $externalToStore = $externalId ?: $hash;
+            // default: new
+            $finalStatus = 'new';
+            $skipReason = null;
 
-            $exists = Inquiry::query()
-                ->where('external_id', $externalToStore)
-                ->exists();
-
-            if ($exists) {
-                $message->setFlag('Seen');
-                continue;
+            // 0) lookback cutoff
+            if ($receivedAt->lt($since)) {
+                $finalStatus = 'skipped';
+                $skipReason = 'lookback_old';
             }
 
-            // Upis
-            Inquiry::create([
-                'source'      => "email:{$inboxKey}",
-                'external_id' => $externalToStore,
+            // 1) follow-up / replies
+            if ($finalStatus === 'new' && (
+                ! empty($inReplyTo) ||
+                ! empty($references) ||
+                preg_match('/^(re:|fw:|fwd:)\s*/i', $subjectNorm)
+            )) {
+                $finalStatus = 'skipped';
+                $skipReason = 'follow_up';
+            }
 
-                'guest_email' => $fromEmail ?: null,
+            // 2) system “Request from …”
+            if ($finalStatus === 'new' && str_contains($subjectNorm, 'request from')) {
+                $finalStatus = 'skipped';
+                $skipReason = 'request_from';
+            }
+
+            // 3) system/spam (konzervativno)
+            if ($finalStatus === 'new' && $this->isSystemOrSpam($fromLower, $subjectNorm, $bodyNorm)) {
+                $finalStatus = 'skipped';
+                $skipReason = 'system_or_spam';
+            }
+
+            // 4) vlasnici smeštaja / listing requests
+            if ($finalStatus === 'new' && $this->isListingRequest($subjectNorm, $bodyNorm)) {
+                $finalStatus = 'skipped';
+                $skipReason = 'listing_request';
+            }
+
+            // ---- upsert
+            $payload = [
+                'source'      => "imap:{$inboxKey}",
+                'message_id'  => $messageId !== '' ? $messageId : null,
+                'from_email'  => $fromEmail ?: null,
                 'subject'     => $subjectTrim !== '' ? $subjectTrim : null,
-                'raw_message' => $body,
-
-                'status'      => 'new',
                 'received_at' => $receivedAt,
-            ]);
+                'headers'     => [
+                    'message-id'   => $messageId,
+                    'in-reply-to'  => $inReplyTo,
+                    'references'   => $references,
+                    'skip_reason'  => $skipReason,
+                    'fetch_mode'   => $mode,
+                    'folder'       => $folderName,
+                    'inbox'        => $inboxKey,
+                ],
+                'raw_body'    => $body,
+                'status'      => $finalStatus,
+                'ai_stopped'  => false,
+                'inquiry_id'  => null, // popunjava ai:sync-inquiries
+            ];
 
-            $message->setFlag('Seen');
-            $count++;
+            // updateOrCreate ne kaže da li je created; uradimo ručno:
+            $existing = AiInquiry::query()->where('message_hash', $messageHash)->first();
+
+            if ($existing) {
+                $existing->fill($payload)->save();
+                $countUpdated++;
+            } else {
+                AiInquiry::create(array_merge(['message_hash' => $messageHash], $payload));
+                if ($finalStatus === 'new') $countNew++; else $countSkipped++;
+            }
+
+            // Seen flag: samo u unseen modu (u ALL modu ne diramo inbox)
+            if ($mode !== 'all') {
+                try { $message->setFlag('Seen'); } catch (\Throwable) {}
+            }
+
+            if ($finalStatus !== 'new') {
+                Log::info('GiImapPullInquiries: skipped', [
+                    'reason' => $skipReason,
+                    'inbox' => $inboxKey,
+                    'folder' => $folderName,
+                    'mode' => $mode,
+                    'from' => $fromEmail,
+                    'subject' => $subjectTrim !== '' ? $subjectTrim : null,
+                    'message_id' => $messageId,
+                    'received_at' => $receivedAt->toDateTimeString(),
+                ]);
+            }
         }
 
-        $this->info("Imported: {$count}");
+        $this->info("Imported into ai_inquiries: new={$countNew}, updated={$countUpdated}, skipped={$countSkipped} (mode={$mode})");
     }
 
     private function normalizeSubject(string $subjectTrim): string
@@ -242,5 +276,101 @@ class GiImapPullInquiries extends Command
         $norm = preg_replace('/\s*:\s*/', ':', $norm);
 
         return $norm ?: '';
+    }
+
+    private function isSystemOrSpam(string $fromLower, string $subjectNorm, string $bodyNorm): bool
+    {
+        $senderBad = [
+            'no-reply@',
+            'noreply@',
+            'postmaster@',
+            '@notifications.google.com',
+            '@accounts.google.com',
+            '@webhotelier',
+            '@mailer-daemon',
+            '@flippa.com',
+            '@mailchimp',
+        ];
+
+        foreach ($senderBad as $needle) {
+            if ($needle !== '' && str_contains($fromLower, $needle)) {
+                return true;
+            }
+        }
+
+        $subjectBad = [
+            'invoice',
+            'payment',
+            'security alert',
+            'new device',
+            'password',
+            'affiliate',
+            'b2b',
+            'webhotelier',
+            'want to sell',
+            'domain',
+            'newsletter',
+            'unsubscribe',
+            'verification',
+            'confirm your',
+            'receipt',
+            'order confirmation',
+            'confirmation', // često nisu gosti nego system potvrde
+        ];
+
+        foreach ($subjectBad as $needle) {
+            if ($needle !== '' && str_contains($subjectNorm, $needle)) {
+                return true;
+            }
+        }
+
+        // body signals (tek kad ima više signala)
+        $bodyBad = [
+            'unsubscribe',
+            'view in browser',
+            'marketing',
+            'campaign',
+            'promo code',
+            'limited offer',
+            'follow us on',
+        ];
+
+        $hits = 0;
+        foreach ($bodyBad as $needle) {
+            if ($needle !== '' && str_contains($bodyNorm, $needle)) {
+                $hits++;
+            }
+        }
+
+        return $hits >= 2;
+    }
+
+    private function isListingRequest(string $subjectNorm, string $bodyNorm): bool
+    {
+        $needles = [
+            'new listing',
+            'list my property',
+            'add my property',
+            'how can i list',
+            'i want to list',
+            'advertise my',
+            'property owner',
+            'vlasnik smeštaja',
+            'vlasnik smestaja',
+            'oglašavanje smeštaja',
+            'oglasavanje smestaja',
+            'kako da oglasim',
+            'dodam smeštaj',
+            'dodam smestaj',
+            'how can i advertise',
+        ];
+
+        foreach ($needles as $needle) {
+            if ($needle !== '' && (str_contains($subjectNorm, $needle) || str_contains($bodyNorm, $needle))) {
+                return true;
+            }
+        }
+
+        return false;
     }
 }

@@ -25,6 +25,7 @@ class AiParseInquiries extends Command
         $retry = (bool) $this->option('retry');
         $force = (bool) $this->option('force');
 
+        // IDs first -> lock per row in TX (avoid race)
         $q = AiInquiry::query()
             ->whereNotNull('inquiry_id')
             ->where('ai_stopped', false)
@@ -36,15 +37,29 @@ class AiParseInquiries extends Command
             $q->where('status', 'synced');
         }
 
-        $items = $q->limit($limit)->get();
+        $ids = $q->limit($limit)->pluck('id')->all();
 
         $processed = 0;
-        $skipped = 0;
-        $failed = 0;
+        $skipped   = 0;
+        $failed    = 0;
 
-        foreach ($items as $ai) {
+        foreach ($ids as $id) {
             try {
-                DB::transaction(function () use ($ai, $extractor, $force, &$processed, &$skipped) {
+                DB::transaction(function () use ($id, $extractor, $force, &$processed, &$skipped) {
+
+                    /** @var AiInquiry|null $ai */
+                    $ai = AiInquiry::query()->whereKey($id)->lockForUpdate()->first();
+
+                    if (! $ai) {
+                        $skipped++;
+                        return;
+                    }
+
+                    if ($ai->ai_stopped) {
+                        $skipped++;
+                        return;
+                    }
+
                     /** @var Inquiry|null $inquiry */
                     $inquiry = Inquiry::query()->find($ai->inquiry_id);
 
@@ -67,17 +82,20 @@ class AiParseInquiries extends Command
                         return;
                     }
 
-                    $out = $extractor->extract($inquiry); // vraća standardizovan array + _mode
+                    $out = $extractor->extract($inquiry); // standard array + _mode
 
                     $this->fillFromExtractor($inquiry, $out, $force);
 
                     $missingHuman = InquiryMissingData::detect($inquiry);
 
                     $inquiry->extraction_mode  = (string) ($out['_mode'] ?? 'fallback');
-                    $inquiry->extraction_debug = json_encode($out, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                    $inquiry->extraction_debug = $out; // cast array u modelu
                     $inquiry->processed_at     = Carbon::now();
 
-                    $inquiry->status = empty($missingHuman) ? 'extracted' : 'new';
+                    $inquiry->status = empty($missingHuman)
+                        ? Inquiry::STATUS_EXTRACTED
+                        : Inquiry::STATUS_NEEDS_INFO;
+
                     $inquiry->save();
 
                     $ai->status = empty($missingHuman) ? 'parsed' : 'needs_info';
@@ -91,13 +109,14 @@ class AiParseInquiries extends Command
                 $failed++;
 
                 try {
-                    $ai->status = 'error';
-                    $ai->missing_fields = array_values(array_unique(array_filter([
-                        'exception',
-                        mb_strimwidth((string) $e->getMessage(), 0, 160, '...'),
-                    ])));
-                    $ai->parsed_at = Carbon::now();
-                    $ai->save();
+                    AiInquiry::query()->whereKey($id)->update([
+                        'status' => 'error',
+                        'missing_fields' => array_values(array_unique(array_filter([
+                            'exception',
+                            mb_strimwidth((string) $e->getMessage(), 0, 160, '...'),
+                        ]))),
+                        'parsed_at' => Carbon::now(),
+                    ]);
                 } catch (\Throwable) {
                     // ignore
                 }
@@ -114,7 +133,7 @@ class AiParseInquiries extends Command
             if ($value === null || $value === '') {
                 return;
             }
-            if ($force || $inquiry->{$field} === null || $inquiry->{$field} === '' ) {
+            if ($force || $inquiry->{$field} === null || $inquiry->{$field} === '') {
                 $inquiry->{$field} = $value;
             }
         };
@@ -127,13 +146,30 @@ class AiParseInquiries extends Command
         $set('date_to', $out['date_to'] ?? null);
         $set('nights', $out['nights'] ?? null);
 
-        $set('adults', $out['adults'] ?? null);
-        $set('children', $out['children'] ?? null);
+        // Normalize adults/children (AI može vratiti string/array)
+        $adults = $out['adults'] ?? null;
+        $children = $out['children'] ?? null;
 
-        // children_ages je cast array u modelu
-        if (array_key_exists('children_ages', $out) && is_array($out['children_ages'])) {
+        if (is_array($adults))   $adults = count($adults);
+        if (is_array($children)) $children = count($children);
+
+        if (is_string($adults)) {
+            $n = (int) preg_replace('/\D+/', '', $adults);
+            $adults = $n > 0 ? $n : null;
+        }
+        if (is_string($children)) {
+            $n = (int) preg_replace('/\D+/', '', $children);
+            $children = $n >= 0 ? $n : null;
+        }
+
+        $set('adults', $adults);
+        $set('children', $children);
+
+        // children_ages: može doći kao string ili array -> normalize
+        if (array_key_exists('children_ages', $out)) {
+            $ages = \App\Services\InquiryMissingData::normalizeChildrenAges($out['children_ages']);
             if ($force || empty($inquiry->children_ages)) {
-                $inquiry->children_ages = $out['children_ages'];
+                $inquiry->children_ages = $ages;
             }
         }
 

@@ -48,13 +48,14 @@ class ViewInquiry extends ViewRecord
                 ->visible(fn () =>
                     filled($this->record->guest_email) &&
                     filled($this->record->ai_draft) &&
-                    in_array($this->record->status, ['extracted', 'suggested'], true)
+                    in_array($this->record->status, ['needs_info', 'extracted', 'suggested'], true)
                 )
                 ->fillForm(function () {
                     /** @var Inquiry $record */
                     $record = $this->record;
 
-                    $inbox = str_contains((string) $record->source, 'email:info') ? 'info' : 'booking';
+                    $src = (string) ($record->source ?? '');
+                    $inbox = str_contains($src, 'info') ? 'info' : 'booking';
 
                     return [
                         'inbox'   => $inbox,
@@ -190,11 +191,13 @@ class ViewInquiry extends ViewRecord
                     Select::make('status')
                         ->label('Status')
                         ->options([
-                            'new'       => 'New',
-                            'extracted' => 'Extracted',
-                            'suggested' => 'Suggested',
-                            'replied'   => 'Replied',
-                            'closed'    => 'Closed',
+                            'new'        => 'New',
+                            'needs_info' => 'Needs info',
+                            'extracted'  => 'Extracted',
+                            'suggested'  => 'Suggested',
+                            'replied'    => 'Replied',
+                            'closed'     => 'Closed',
+                            'no_ai'      => 'Bez AI obrade',
                         ])
                         ->required(),
                 ])
@@ -251,61 +254,99 @@ class ViewInquiry extends ViewRecord
                 ->requiresConfirmation()
                 ->action(function () {
                     /** @var Inquiry $record */
-                    $record = $this->record;
+                    $record = Inquiry::query()
+                        ->with('aiInquiry')
+                        ->findOrFail($this->record->getKey());
+
+                    // ✅ sinhronizuj Livewire/Filament record
+                    $this->record = $record;
 
                     $extractor = app(InquiryAiExtractor::class);
                     $data = $extractor->extract($record);
 
-                    $record->region     = $data['region']     ?? $record->region;
-                    $record->location   = $data['location']   ?? $record->location;
-                    $record->month_hint = $data['month_hint'] ?? $record->month_hint;
+                    // --- fill basic extracted fields (ne briši postojeće ako AI vrati null) ---
+                    foreach (['region','location','month_hint'] as $k) {
+                        if (array_key_exists($k, $data) && filled($data[$k])) {
+                            $record->{$k} = $data[$k];
+                        }
+                    }
 
-                    $record->date_from  = $data['date_from']  ?? $record->date_from;
-                    $record->date_to    = $data['date_to']    ?? $record->date_to;
-                    $record->nights     = $data['nights']     ?? $record->nights;
+                    if (!empty($data['date_from'])) {
+                        $record->date_from = $data['date_from'];
+                    }
+                    if (!empty($data['date_to'])) {
+                        $record->date_to = $data['date_to'];
+                    }
+                    if (array_key_exists('nights', $data) && $data['nights'] !== null) {
+                        $record->nights = (int) $data['nights'];
+                    }
 
-                    $adults   = $data['adults'] ?? null;
+                    // --- adults / children ---
+                    $adults   = $data['adults']   ?? null;
                     $children = $data['children'] ?? null;
 
                     if (is_array($adults))   $adults = count($adults);
                     if (is_array($children)) $children = count($children);
 
-                    if (is_string($adults)) {
-                        $adults = (int) preg_replace('/\D+/', '', $adults) ?: null;
-                    }
-                    if (is_string($children)) {
-                        $children = (int) preg_replace('/\D+/', '', $children) ?: null;
-                    }
+                    if (is_string($adults))   $adults = (int) preg_replace('/\D+/', '', $adults) ?: null;
+                    if (is_string($children)) $children = (int) preg_replace('/\D+/', '', $children) ?: null;
 
-                    if (is_int($adults)) {
-                        $record->adults = $adults;
-                    }
-                    if (is_int($children)) {
-                        $record->children = $children;
-                    }
+                    if (is_int($adults))   $record->adults = $adults;
+                    if (is_int($children)) $record->children = $children;
 
+                    // --- children ages (uvek normalizuj ako je ključ prisutan) ---
                     if (array_key_exists('children_ages', $data)) {
                         $record->children_ages = InquiryMissingData::normalizeChildrenAges($data['children_ages']);
                     }
 
-                    $record->budget_min = $data['budget_min'] ?? $record->budget_min;
-                    $record->budget_max = $data['budget_max'] ?? $record->budget_max;
+                    // --- budget ---
+                    foreach (['budget_min','budget_max'] as $k) {
+                        if (array_key_exists($k, $data) && $data[$k] !== null) {
+                            $record->{$k} = $data[$k];
+                        }
+                    }
 
-                    $record->wants_near_beach = $data['wants_near_beach'] ?? $record->wants_near_beach;
-                    $record->wants_parking    = $data['wants_parking'] ?? $record->wants_parking;
-                    $record->wants_quiet      = $data['wants_quiet'] ?? $record->wants_quiet;
-                    $record->wants_pets       = $data['wants_pets'] ?? $record->wants_pets;
-                    $record->wants_pool       = $data['wants_pool'] ?? $record->wants_pool;
+                    // --- wants ---
+                    foreach (['wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool'] as $k) {
+                        if (array_key_exists($k, $data) && $data[$k] !== null) {
+                            $record->{$k} = (bool) $data[$k];
+                        }
+                    }
 
-                    $record->special_requirements = $data['special_requirements'] ?? $record->special_requirements;
+                    if (array_key_exists('special_requirements', $data) && filled($data['special_requirements'])) {
+                        $record->special_requirements = $data['special_requirements'];
+                    }
 
                     $record->language = $data['language'] ?? $record->language ?? 'sr';
-                    $record->extraction_mode = $data['_mode'] ?? $record->extraction_mode ?? 'fallback';
-                    $record->extraction_debug = json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+                    $record->extraction_mode  = $data['_mode'] ?? $record->extraction_mode ?? 'fallback';
+                    $record->extraction_debug = $data;
 
-                    $record->status = 'extracted';
+                    // ✅ KLJUČNO: deterministički izračun date_to ako imamo date_from + nights
+                    if ($record->date_from && $record->nights && ! $record->date_to) {
+                        try {
+                            $record->date_to = Carbon::parse($record->date_from)
+                                ->addDays((int) $record->nights)
+                                ->toDateString();
+                        } catch (\Throwable) {
+                            // ignore
+                        }
+                    }
+
+                    // ✅ Statusi: izračunaj missing i sync-uj i Inquiry i AiInquiry
+                    $missing = InquiryMissingData::detect($record);
+
+                    $record->status = empty($missing) ? 'extracted' : Inquiry::STATUS_NEEDS_INFO;
                     $record->processed_at = now();
                     $record->save();
+
+                    // sync ai_inquiries
+                    $record->loadMissing('aiInquiry');
+                    if ($record->aiInquiry) {
+                        $record->aiInquiry->missing_fields = empty($missing) ? null : $missing;
+                        $record->aiInquiry->status = empty($missing) ? 'parsed' : 'needs_info';
+                        $record->aiInquiry->parsed_at = now();
+                        $record->aiInquiry->save();
+                    }
 
                     Notification::make()
                         ->title('Extraction je uspešno izvršena')
@@ -339,7 +380,7 @@ class ViewInquiry extends ViewRecord
                             'missing' => $missing,
                         ])->render();
 
-                        $record->status = 'extracted';
+                        $record->status = Inquiry::STATUS_NEEDS_INFO;
                         $record->processed_at = now();
                         $record->save();
 
@@ -630,12 +671,14 @@ class ViewInquiry extends ViewRecord
                                                                     ->label('Status')
                                                                     ->badge()
                                                                     ->color(fn ($state) => match ($state) {
-                                                                        'new' => 'gray',
-                                                                        'extracted' => 'warning',
-                                                                        'suggested' => 'info',
-                                                                        'replied' => 'success',
-                                                                        'closed' => 'danger',
-                                                                        default => 'gray',
+                                                                        'new'        => 'gray',
+                                                                        'needs_info' => 'warning',
+                                                                        'extracted'  => 'warning',
+                                                                        'suggested'  => 'info',
+                                                                        'replied'    => 'success',
+                                                                        'no_ai'      => 'gray',
+                                                                        'closed'     => 'danger',
+                                                                        default      => 'gray',
                                                                     }),
                                                                 TextEntry::make('reply_mode')
                                                                     ->label('Odgovor')

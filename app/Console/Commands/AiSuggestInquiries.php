@@ -5,6 +5,7 @@ namespace App\Console\Commands;
 use App\Models\AiInquiry;
 use App\Models\Inquiry;
 use App\Services\InquiryAccommodationMatcher;
+use App\Services\InquiryMissingData;
 use Illuminate\Console\Command;
 use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\DB;
@@ -19,27 +20,46 @@ class AiSuggestInquiries extends Command
         $limit = (int) $this->option('limit');
         $force = (bool) $this->option('force');
 
-        $statuses = ['parsed', 'needs_info', 'error'];
+        // U normalnom toku: sugestije imaju smisla tek kad je parsed.
+        // needs_info НЕ СМЕ да прави понуду (1:1 dogovor) – ali smemo da ga "dotaknemo" radi statusa.
+        $statuses = ['parsed', 'needs_info'];
+
+        // error obrađuj samo kad force (da ne trošimo vreme i da ne maskiramo probleme)
         if ($force) {
+            $statuses[] = 'error';
             $statuses[] = 'no_availability';
             $statuses[] = 'suggested';
         }
 
-        $items = AiInquiry::query()
+        $ids = AiInquiry::query()
             ->whereNotNull('inquiry_id')
             ->where('ai_stopped', false)
             ->whereIn('status', $statuses)
             ->orderBy('received_at')
             ->limit($limit)
-            ->get();
+            ->pluck('id')
+            ->all();
 
         $processed = 0;
-        $skipped = 0;
-        $failed = 0;
+        $skipped   = 0;
+        $failed    = 0;
 
-        foreach ($items as $ai) {
+        foreach ($ids as $id) {
             try {
-                DB::transaction(function () use ($ai, $matcher, $force, &$processed, &$skipped) {
+                DB::transaction(function () use ($id, $matcher, $force, &$processed, &$skipped) {
+
+                    /** @var AiInquiry|null $ai */
+                    $ai = AiInquiry::query()->whereKey($id)->lockForUpdate()->first();
+
+                    if (! $ai) {
+                        $skipped++;
+                        return;
+                    }
+
+                    if ($ai->ai_stopped) {
+                        $skipped++;
+                        return;
+                    }
 
                     /** @var Inquiry|null $inquiry */
                     $inquiry = Inquiry::query()->find($ai->inquiry_id);
@@ -58,14 +78,35 @@ class AiSuggestInquiries extends Command
                         return;
                     }
 
-                    // Ako već ima sačuvane sugestije i nije force
+                    // 1:1 zahtev — ako fale ključni podaci, NEMA ponude/sugestija
+                    $missing = InquiryMissingData::detect($inquiry);
+                    if (! empty($missing)) {
+                        // držimo jasno stanje
+                        if ($inquiry->status !== Inquiry::STATUS_NEEDS_INFO) {
+                            $inquiry->status = Inquiry::STATUS_NEEDS_INFO;
+                            $inquiry->processed_at = Carbon::now();
+                            $inquiry->save();
+                        }
+
+                        $ai->status = 'needs_info';
+                        $ai->missing_fields = $missing;
+                        $ai->suggested_at = Carbon::now();
+                        $ai->save();
+
+                        $skipped++;
+                        return;
+                    }
+
+                    // Ako već ima sačuvane sugestije i nije force, samo osveži statuse
                     if (! $force && ! empty($ai->suggestions_payload)) {
-                        if ($inquiry->status === 'extracted') {
+                        if (in_array($inquiry->status, ['new', 'extracted'], true)) {
                             $inquiry->status = 'suggested';
+                            $inquiry->processed_at = Carbon::now();
                             $inquiry->save();
                         }
 
                         $ai->status = 'suggested';
+                        $ai->missing_fields = null;
                         $ai->suggested_at = Carbon::now();
                         $ai->save();
 
@@ -97,9 +138,10 @@ class AiSuggestInquiries extends Command
                         $ai->status = 'suggested';
                         $ai->missing_fields = null;
                     } else {
-                        // nema ni primary ni alternative
+                        // nema ni primary ni alternative -> no_availability
                         if ($inquiry->status === 'new') {
                             $inquiry->status = 'extracted';
+                            $inquiry->processed_at = Carbon::now();
                             $inquiry->save();
                         }
 
@@ -113,15 +155,16 @@ class AiSuggestInquiries extends Command
             } catch (\Throwable $e) {
                 $failed++;
 
-                $this->error("Suggest failed for ai_inquiry_id={$ai->id}: {$e->getMessage()}");
+                $this->error("Suggest failed for ai_inquiry_id={$id}: {$e->getMessage()}");
 
                 try {
-                    $ai->status = 'error';
-                    $ai->missing_fields = array_values(array_unique(array_filter([
-                        'suggest_exception',
-                        mb_strimwidth((string) $e->getMessage(), 0, 160, '...'),
-                    ])));
-                    $ai->save();
+                    AiInquiry::query()->whereKey($id)->update([
+                        'status' => 'error',
+                        'missing_fields' => array_values(array_unique(array_filter([
+                            'suggest_exception',
+                            mb_strimwidth((string) $e->getMessage(), 0, 160, '...'),
+                        ]))),
+                    ]);
                 } catch (\Throwable) {
                     // ignore
                 }

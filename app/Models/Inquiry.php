@@ -2,20 +2,21 @@
 
 namespace App\Models;
 
+use App\Services\InquiryMissingData;
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
-use App\Services\InquiryMissingData;
 
 class Inquiry extends Model
 {
     use HasFactory;
 
-    // Statusi (drži jasno u jednom mestu)
     public const STATUS_NEW        = 'new';
-    public const STATUS_IN_REVIEW  = 'in_review';
-    public const STATUS_DONE       = 'done';
-    public const STATUS_NO_AI      = 'no_ai';       // npr. limit reached ili ai_stopped
-    public const STATUS_NEEDS_INFO = 'needs_info';  // missing data
+    public const STATUS_NEEDS_INFO = 'needs_info';
+    public const STATUS_EXTRACTED  = 'extracted';
+    public const STATUS_SUGGESTED  = 'suggested';
+    public const STATUS_REPLIED    = 'replied';
+    public const STATUS_CLOSED     = 'closed';
+    public const STATUS_NO_AI      = 'no_ai';
 
     protected $fillable = [
         'source',
@@ -68,13 +69,14 @@ class Inquiry extends Model
         'received_at'  => 'datetime',
         'processed_at' => 'datetime',
 
-        'nights'       => 'integer',
-        'adults'       => 'integer',
-        'children'     => 'integer',
-        'budget_min'   => 'integer',
-        'budget_max'   => 'integer',
+        'nights'     => 'integer',
+        'adults'     => 'integer',
+        'children'   => 'integer',
+        'budget_min' => 'integer',
+        'budget_max' => 'integer',
 
-        'children_ages' => 'array',
+        // DB kolone su json
+        'children_ages'    => 'array',
         'extraction_debug' => 'array',
 
         'wants_near_beach' => 'boolean',
@@ -87,7 +89,8 @@ class Inquiry extends Model
     ];
 
     protected $attributes = [
-        'status' => self::STATUS_NEW,
+        'status'      => self::STATUS_NEW,
+        'reply_mode'  => 'ai_draft',
         'is_priority' => false,
     ];
 
@@ -97,23 +100,44 @@ class Inquiry extends Model
     }
 
     /**
-     * Normalizacija children_ages:
+     * children_ages normalizacija:
      * - null | "5,3" | "[5,3]" | ["5","3"] -> [5,3]
      */
     public function getChildrenAgesAttribute($value): array
     {
-        // $value može biti: null | string | array (zbog $casts)
         return InquiryMissingData::normalizeChildrenAges($value);
     }
 
     public function setChildrenAgesAttribute($value): void
     {
-        $ages = InquiryMissingData::normalizeChildrenAges($value);
+        $normalized = InquiryMissingData::normalizeChildrenAges($value);
 
-        // ✅ u bazi čuvamo JSON string (da bude stabilno), a accessor vraća array
-        $this->attributes['children_ages'] = json_encode($ages, JSON_UNESCAPED_UNICODE);
+        // Pošto je kolona json, najstabilnije je upisati JSON string.
+        // (Eloquent cast će svakako raditi, ali ovako izbegavamo edge slučajeve)
+        $this->attributes['children_ages'] = json_encode($normalized, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
     }
 
+    public function setExtractionDebugAttribute($value): void
+    {
+        if ($value === null || $value === '') {
+            $this->attributes['extraction_debug'] = json_encode([], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            return;
+        }
+
+        if (is_string($value)) {
+            $decoded = json_decode($value, true);
+            $payload = is_array($decoded) ? $decoded : ['raw' => $value];
+
+            $this->attributes['extraction_debug'] = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            return;
+        }
+
+        $payload = is_array($value) ? $value : (array) $value;
+
+        $this->attributes['extraction_debug'] = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+    }
+
+    // Scopes
     public function scopePriority($q)
     {
         return $q->where('is_priority', true);
@@ -127,5 +151,20 @@ class Inquiry extends Model
     public function scopeNeedsInfo($q)
     {
         return $q->where('status', self::STATUS_NEEDS_INFO);
+    }
+
+    public function scopeNoAi($q)
+    {
+        return $q->where('status', self::STATUS_NO_AI);
+    }
+
+    public function scopeExtracted($q)
+    {
+        return $q->where('status', self::STATUS_EXTRACTED);
+    }
+
+    public function scopeSuggested($q)
+    {
+        return $q->where('status', self::STATUS_SUGGESTED);
     }
 }

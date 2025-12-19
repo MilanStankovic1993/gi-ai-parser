@@ -15,57 +15,62 @@ Artisan::command('inspire', function () {
 
 /*
 |--------------------------------------------------------------------------
-| GI AI Parser – scheduled pipeline (Laravel 11)
+| GI AI Parser – scheduled pipeline (Laravel 11/12)
 |--------------------------------------------------------------------------
-| Redosled:
-| 1) ingest local emails  -> ai_inquiries
-| 2) sync ai_inquiries    -> inquiries
-| 3) parse inquiries     -> extracted / needs_info
-| 4) suggest hotels      -> suggestions_payload
+| Order:
+| 1) IMAP pull -> ai_inquiries (raw inbox)
+| 2) Sync      -> inquiries (business record)
+| 3) Parse     -> extracted / needs_info
+| 4) Suggest   -> suggestions_payload
 |
-| IMAP varijanta je isključena (ostavljena kao komentar).
+| Notes:
+| - runInBackground() da schedule:run ne blokira
+| - withoutOverlapping() da se ne sudaraju
+| - onOneServer() ako kasnije bude više instanci
 |--------------------------------------------------------------------------
 */
 
-// -------------------------------------------------
-// 1) Ingest LOCAL inbox (.eml / .txt)
-// -------------------------------------------------
-Schedule::command('ai:ingest-local --limit=50')
-    ->everyTwoMinutes()
-    ->withoutOverlapping();
+// 1) IMAP ingest (Gmail) -> ai_inquiries
+Schedule::command('gi:imap-pull --limit=30')
+    ->everyMinute()
+    ->name('gi:imap-pull')
+    ->withoutOverlapping(5)
+    ->runInBackground()
+    ->onOneServer();
 
-// -------------------------------------------------
 // 2) Sync ai_inquiries -> inquiries
-// -------------------------------------------------
 Schedule::command('ai:sync-inquiries --limit=50')
-    ->everyTwoMinutes()
-    ->withoutOverlapping();
+    ->everyMinute()
+    ->name('ai:sync-inquiries')
+    ->withoutOverlapping(5)
+    ->runInBackground()
+    ->onOneServer();
 
-// -------------------------------------------------
-// 3) Parse inquiries (AI ili fallback)
-// -------------------------------------------------
+// 3) Parse inquiries (može biti skuplje kad uključiš AI)
 Schedule::command('ai:parse --limit=50')
     ->everyTwoMinutes()
-    ->withoutOverlapping();
+    ->name('ai:parse')
+    ->withoutOverlapping(10)
+    ->runInBackground()
+    ->onOneServer();
 
-// -------------------------------------------------
-// 4) Suggest hotels (primary + alternatives)
-// -------------------------------------------------
+// 4) Suggest hotels
 Schedule::command('ai:suggest --limit=50')
     ->everyTwoMinutes()
-    ->withoutOverlapping();
+    ->name('ai:suggest')
+    ->withoutOverlapping(10)
+    ->runInBackground()
+    ->onOneServer();
 
 /*
 |--------------------------------------------------------------------------
-| IMAP variant (PRODUCTION) – trenutno ISKLJUČENO
+| Optional: local ingest (ako ga koristiš)
 |--------------------------------------------------------------------------
-| Kada pređeš na IMAP, samo:
-| 1) zakomentariši ai:ingest-local
-| 2) odkomentariši ovo ispod
-|--------------------------------------------------------------------------
-|
-| Schedule::command('gi:imap-pull --limit=50')
-|     ->everyTwoMinutes()
-|     ->withoutOverlapping();
-|
+| Ako ga NE koristiš u produkciji, slobodno obriši.
 */
+// Schedule::command('ai:ingest-local --limit=50')
+//     ->everyFiveMinutes()
+//     ->name('ai:ingest-local')
+//     ->withoutOverlapping(10)
+//     ->runInBackground()
+//     ->onOneServer();

@@ -12,16 +12,18 @@ return new class extends Migration
             $table->id();
 
             // Odakle je došao upit (email, web_form, manual...)
-            $table->string('source')->default('email');
-            $table->string('external_id')->nullable(); // npr email message-id
+            $table->string('source', 255)->default('email');
+
+            // Stabilan ID za dedupe (ai:source:message_id/hash)
+            $table->string('external_id', 255)->nullable()->unique();
 
             // Podaci o gostu
-            $table->string('guest_name')->nullable();
-            $table->string('guest_email')->nullable();
-            $table->string('guest_phone')->nullable();
+            $table->string('guest_name', 255)->nullable();
+            $table->string('guest_email', 255)->nullable();
+            $table->string('guest_phone', 255)->nullable();
 
             // Subject
-            $table->string('subject')->nullable();
+            $table->string('subject', 255)->nullable();
 
             // Originalni tekst upita
             $table->text('raw_message');
@@ -30,16 +32,18 @@ return new class extends Migration
             $table->longText('ai_draft')->nullable();
 
             // Summary polja (AI popunjava)
-            $table->string('region')->nullable();
-            $table->string('location')->nullable(); // mesto/naselje (Pefkohori, Stavros...)
+            $table->string('region', 255)->nullable();
+            $table->string('location', 255)->nullable();
             $table->date('date_from')->nullable();
             $table->date('date_to')->nullable();
-            $table->string('month_hint')->nullable(); // "druga polovina juna" itd.
+            $table->string('month_hint', 255)->nullable();
 
             $table->unsignedInteger('nights')->nullable();
             $table->unsignedInteger('adults')->nullable();
             $table->unsignedInteger('children')->nullable();
-            $table->string('children_ages')->nullable(); // JSON string npr "[5,3]"
+
+            // JSON: npr [5,3]
+            $table->json('children_ages')->nullable();
 
             // Budžet
             $table->unsignedInteger('budget_min')->nullable();
@@ -54,15 +58,17 @@ return new class extends Migration
             $table->text('special_requirements')->nullable();
 
             // Language (sr/en/...)
-            $table->string('language')->nullable();
+            $table->string('language', 10)->nullable();
 
-            // Status obrade (business status)
+            // Status obrade (business status) — usklađeno sa modelom/komandama
             $table->enum('status', [
                 'new',
+                'needs_info', // fali ključni podatak -> pitanja
                 'extracted',
                 'suggested',
                 'replied',
                 'closed',
+                'no_ai',      // limit reached / ai stopped / ručno
             ])->default('new');
 
             // Način odgovora
@@ -71,9 +77,9 @@ return new class extends Migration
                 'manual',
             ])->default('ai_draft');
 
-            // Extraction meta (AI vs fallback) + debug
-            $table->string('extraction_mode')->nullable(); // 'ai' | 'fallback' | 'openai' | 'local' (kako već koristiš)
-            $table->text('extraction_debug')->nullable();
+            // Extraction meta + debug
+            $table->string('extraction_mode', 50)->nullable(); // ai|fallback|...
+            $table->json('extraction_debug')->nullable();
 
             $table->boolean('is_priority')->default(false);
 
@@ -82,9 +88,9 @@ return new class extends Migration
 
             $table->timestamps();
 
-            // (opciono) korisni indexi
+            // Indexi
             $table->index(['status', 'received_at']);
-            $table->index(['guest_email']);
+            $table->index('guest_email');
         });
     }
 

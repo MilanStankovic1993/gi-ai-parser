@@ -8,13 +8,24 @@ use App\Models\Grcka\Room;
 use App\Models\Grcka\RoomPrice;
 use App\Models\Grcka\RoomAvailability;
 use Carbon\Carbon;
+use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Collection;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Str;
 
 class InquiryAccommodationMatcher
 {
     /**
-     * Backward-compatible: vraća samo primary kolekciju.
+     * Tekstualne kolone u pt_locations koje su korisne za fuzzy lookup
      */
+    private static array $locationTextColumns = ['location', 'title', 'h1', 'region', 'link', 'desc'];
+
+    /**
+     * Cache cena po sobi (da ne tucamo DB po sobi u petlji)
+     * [roomId => Collection<RoomPrice>]
+     */
+    private array $pricesCache = [];
+
     public function match(Inquiry $inquiry, int $limit = 5): Collection
     {
         $out = $this->matchWithAlternatives($inquiry, $limit, $limit);
@@ -22,9 +33,6 @@ class InquiryAccommodationMatcher
         return collect($out['primary'] ?? []);
     }
 
-    /**
-     * Produkcijski: vraća primary + alternatives + log.
-     */
     public function matchWithAlternatives(Inquiry $inquiry, int $primaryLimit = 5, int $altLimit = 5): array
     {
         $log = [
@@ -45,11 +53,7 @@ class InquiryAccommodationMatcher
         if (! $inquiry->date_from || ! $inquiry->date_to || ! $inquiry->adults) {
             $log['reason'] = 'missing_required_fields_for_offer';
 
-            return [
-                'primary'      => collect(),
-                'alternatives' => collect(),
-                'log'          => $log,
-            ];
+            return ['primary' => collect(), 'alternatives' => collect(), 'log' => $log];
         }
 
         $from = Carbon::parse($inquiry->date_from)->startOfDay();
@@ -59,17 +63,13 @@ class InquiryAccommodationMatcher
         if ($nights <= 0) {
             $log['reason'] = 'invalid_nights';
 
-            return [
-                'primary'      => collect(),
-                'alternatives' => collect(),
-                'log'          => $log,
-            ];
+            return ['primary' => collect(), 'alternatives' => collect(), 'log' => $log];
         }
 
         $adults   = (int) $inquiry->adults;
         $children = (int) ($inquiry->children ?: 0);
 
-        // PRIMARY: region + location (ako postoji)
+        // PRIMARY (strogo mesto)
         $primary = $this->runMatch(
             inquiry: $inquiry,
             from: $from,
@@ -88,14 +88,10 @@ class InquiryAccommodationMatcher
         if ($primary->isNotEmpty()) {
             $log['reason'] = 'found_primary';
 
-            return [
-                'primary'      => $primary,
-                'alternatives' => collect(),
-                'log'          => $log,
-            ];
+            return ['primary' => $primary, 'alternatives' => collect(), 'log' => $log];
         }
 
-        // ALTERNATIVES: opustimo mesto (location), region ostaje ako postoji
+        // ALTS (opusti mesto)
         $alternatives = $this->runMatch(
             inquiry: $inquiry,
             from: $from,
@@ -105,7 +101,7 @@ class InquiryAccommodationMatcher
             children: $children,
             limit: $altLimit,
             strictLocation: false,
-            regionOverride: $this->clean($inquiry->region), // može biti null => globalno
+            regionOverride: $this->clean($inquiry->region),
             log: $log
         );
 
@@ -113,13 +109,73 @@ class InquiryAccommodationMatcher
 
         $log['reason'] = $alternatives->isNotEmpty()
             ? 'no_primary_used_alternatives'
-            : 'no_availability';
+            : 'no_availability_or_price';
 
-        return [
-            'primary'      => collect(),
-            'alternatives' => $alternatives,
-            'log'          => $log,
-        ];
+        return ['primary' => collect(), 'alternatives' => $alternatives, 'log' => $log];
+    }
+    public function findFallbackAlternatives(Inquiry $inquiry, int $limit = 5): Collection
+    {
+        // Ovo je fallback koji ViewInquiry očekuje.
+        // Ideja: ako nema location (npr. samo "Tasos"), tretiraj region kao lokaciju.
+        if (! $inquiry->date_from || ! $inquiry->date_to || ! $inquiry->adults) {
+            return collect();
+        }
+
+        $from = Carbon::parse($inquiry->date_from)->startOfDay();
+        $to   = Carbon::parse($inquiry->date_to)->startOfDay();
+
+        $nights = (int) ($inquiry->nights ?: $from->diffInDays($to));
+        if ($nights <= 0) {
+            return collect();
+        }
+
+        $adults   = (int) $inquiry->adults;
+        $children = (int) ($inquiry->children ?: 0);
+
+        // 1) Ako nema location, uzmi region kao lokaciju (Tasos, Lefkada, itd.)
+        $locCandidate = $this->clean($inquiry->location) ?: $this->clean($inquiry->region);
+
+        // Napravi "soft clone" upita (ne snimamo u bazu)
+        $tmp = clone $inquiry;
+        if ($locCandidate) {
+            $tmp->location = $locCandidate;
+        }
+
+        // 2) Pokušaj: strictLocation=true ali BEZ region filtera (jer "Tasos" često nije region u tvojoj bazi nego destinacija)
+        $dummyLog = ['steps' => []];
+
+        $strict = $this->runMatch(
+            inquiry: $tmp,
+            from: $from,
+            to: $to,
+            nights: $nights,
+            adults: $adults,
+            children: $children,
+            limit: $limit,
+            strictLocation: true,
+            regionOverride: null, // <- ključ: ignoriši region
+            log: $dummyLog
+        );
+
+        if ($strict->isNotEmpty()) {
+            return $strict;
+        }
+
+        // 3) Ako ni to ne da ništa: opušteno po celoj bazi (i dalje sort/ai_order radi svoje)
+        $relaxed = $this->runMatch(
+            inquiry: $tmp,
+            from: $from,
+            to: $to,
+            nights: $nights,
+            adults: $adults,
+            children: $children,
+            limit: $limit,
+            strictLocation: false,
+            regionOverride: null,
+            log: $dummyLog
+        );
+
+        return $relaxed;
     }
 
     private function runMatch(
@@ -136,21 +192,51 @@ class InquiryAccommodationMatcher
     ): Collection {
         $region = $this->clean($regionOverride);
 
+        /** @var Builder $hotelsQ */
         $hotelsQ = Hotel::query()
             ->aiEligible()
             ->aiOrdered()
             ->when($region, fn ($q) => $q->matchRegion($region))
-            ->with(['rooms'])
-            ->limit(120);
+            ->with(['rooms', 'location'])
+            ->limit(200);
 
-        // location filter samo u primary
+        // --- Location filter logic ---
         if ($strictLocation) {
-            $loc = $this->clean($inquiry->location);
-            if ($loc) {
-                $hotelsQ->where(function ($q) use ($loc) {
-                    $q->where('hotel_map_city', 'like', "%{$loc}%")
-                      ->orWhere('mesto', 'like', "%{$loc}%");
-                });
+            $locRaw = $this->clean($inquiry->location);
+
+            // 1) pokušaj da pronađeš canonical location_id iz pt_locations (najtačnije!)
+            $resolved = $this->resolveLocationFromDb($locRaw);
+
+            $log['steps'][] = [
+                'step' => 'location_resolve',
+                'strictLocation' => true,
+                'loc_raw' => $locRaw,
+                'resolved' => $resolved,
+            ];
+
+            if (! empty($resolved['location_id'])) {
+                // ✅ NAJTAČNIJE: hotel_city == pt_locations.id
+                $hotelsQ->where('hotel_city', (string) $resolved['location_id']);
+
+                $log['steps'][] = [
+                    'step' => 'location_filter_applied',
+                    'mode' => 'hotel_city_id',
+                    'location_id' => $resolved['location_id'],
+                ];
+            } else {
+                // 2) fallback: needles + robust LIKE preko relacije + fallback polja
+                $needles = $this->expandLocationNeedles($locRaw, $resolved['canonical'] ?? []);
+
+                $log['steps'][] = [
+                    'step' => 'location_filter_setup',
+                    'mode' => 'needles_like',
+                    'needles' => $needles,
+                    'pt_locations_cols' => self::$locationTextColumns,
+                ];
+
+                if (! empty($needles)) {
+                    $this->applyRobustLocationFilter($hotelsQ, $needles, self::$locationTextColumns);
+                }
             }
         }
 
@@ -169,43 +255,47 @@ class InquiryAccommodationMatcher
 
         $results = collect();
 
-        // ✅ mini stats za debug (da vidiš da li availability seče)
+        $roomsTotal = 0;
+        $fitsPass = 0;
         $availabilityMiss = 0;
+        $priceMiss = 0;
+        $priceZeroMiss = 0;
+        $budgetMiss = 0;
 
         foreach ($hotels as $hotel) {
             foreach ($hotel->rooms as $room) {
+                $roomsTotal++;
+
                 if (! $this->roomFits($room, $adults, $children, $nights)) {
                     continue;
                 }
+                $fitsPass++;
 
-                // ✅ availability check (Faza 1: po mesecima koje period zahvata)
                 if (! $this->roomIsAvailableForRange((int) $room->room_id, $from, $to)) {
                     $availabilityMiss++;
                     continue;
                 }
 
-                $priceRow = $this->pickPriceRow((int) $room->room_id, $from, $to, $adults, $children);
-                if (! $priceRow) {
-                    continue;
-                }
+                $total = $this->calculateTotalForRoom((int) $room->room_id, $from, $to, $adults, $children);
 
-                $total = $this->calculateTotal($priceRow, $from, $to);
                 if ($total <= 0) {
+                    $hasRows = $this->getPriceRowsForRoom((int) $room->room_id)->isNotEmpty();
+                    if (! $hasRows) $priceMiss++;
+                    else $priceZeroMiss++;
                     continue;
                 }
 
                 if ($inquiry->budget_max && $total > (int) $inquiry->budget_max) {
+                    $budgetMiss++;
                     continue;
                 }
-
-                $perNight = $total / $nights;
 
                 $results->push([
                     'hotel' => $hotel,
                     'room'  => $room,
                     'price' => [
                         'total'     => round($total, 2),
-                        'per_night' => round($perNight, 2),
+                        'per_night' => round($total / $nights, 2),
                         'nights'    => $nights,
                     ],
                     '_match' => $strictLocation ? 'primary' : 'alternative',
@@ -218,12 +308,59 @@ class InquiryAccommodationMatcher
         }
 
         $log['steps'][] = [
-            'step' => 'availability_stats',
+            'step' => 'filter_stats',
             'strictLocation' => $strictLocation,
+            'rooms_total' => $roomsTotal,
+            'fits_pass' => $fitsPass,
             'availability_miss' => $availabilityMiss,
+            'price_miss' => $priceMiss,
+            'price_zero_miss' => $priceZeroMiss,
+            'budget_miss' => $budgetMiss,
+            'results' => $results->count(),
         ];
 
         return $results;
+    }
+
+    /**
+     * ✅ Filter preko pt_locations relacije + (opciono) fallback preko hotel polja kad hotel_city NULL
+     * Radi sa needle-ovima (razne varijante).
+     */
+    private function applyRobustLocationFilter(Builder $hotelsQ, array $needles, array $locationCols): void
+    {
+        $needles = array_values(array_unique(array_filter(array_map(fn ($x) => trim((string) $x), $needles))));
+
+        // zaštita: preskoči prekratke needle-ove (mnogo false-positive)
+        $needles = array_values(array_filter($needles, fn ($s) => mb_strlen($s) >= 3));
+
+        if (empty($needles)) return;
+
+        $hotelsQ->where(function ($root) use ($needles, $locationCols) {
+            // 1) normalno: whereHas(location)
+            $root->whereHas('location', function ($q) use ($needles, $locationCols) {
+                $q->where(function ($qq) use ($needles, $locationCols) {
+                    foreach ($needles as $loc) {
+                        $locLower = mb_strtolower($loc);
+                        foreach ($locationCols as $col) {
+                            // case-insensitive (sigurno)
+                            $qq->orWhereRaw("LOWER($col) LIKE ?", ["%{$locLower}%"]);
+                        }
+                    }
+                });
+            });
+
+            // 2) fallback kad nemamo hotel_city/location relaciju
+            $root->orWhere(function ($q2) use ($needles) {
+                $q2->whereNull('hotel_city')
+                    ->where(function ($qq2) use ($needles) {
+                        foreach ($needles as $loc) {
+                            $locLower = mb_strtolower($loc);
+                            $qq2->orWhereRaw('LOWER(mesto) LIKE ?', ["%{$locLower}%"])
+                                ->orWhereRaw('LOWER(hotel_map_city) LIKE ?', ["%{$locLower}%"]);
+                        }
+                    });
+            });
+        });
     }
 
     private function roomFits(Room $room, int $adults, int $children, int $nights): bool
@@ -237,18 +374,13 @@ class InquiryAccommodationMatcher
             && $nights >= $minStay;
     }
 
-    /**
-     * ✅ Availability: proveri da li postoji zapis u pt_rooms_availabilities
-     * za svaki mesec koji traženi period zahvata.
-     *
-     * Faza 1: dovoljno je da za te mesece postoji availability zapis.
-     */
     private function roomIsAvailableForRange(int $roomId, Carbon $from, Carbon $to): bool
     {
-        // Availability tabela radi sa y=0 (current year) i y=1 (next year)
         $baseYear = now()->year;
 
         $cursor = $from->copy();
+        $totalDays = 0;
+        $okDays = 0;
 
         while ($cursor->lt($to)) {
             $yearFlag = $cursor->year - $baseYear; // 0 ili 1
@@ -257,7 +389,7 @@ class InquiryAccommodationMatcher
             }
 
             $m = (int) $cursor->month;
-            $day = (int) $cursor->day; // 1..31
+            $day = (int) $cursor->day;
             $col = 'd' . $day;
 
             $row = RoomAvailability::query()
@@ -270,203 +402,288 @@ class InquiryAccommodationMatcher
                 return false;
             }
 
-            // d1..d31: ako je 0 -> nema raspoloživosti za taj dan
+            $totalDays++;
             $val = (int) ($row->{$col} ?? 0);
-            if ($val <= 0) {
-                return false;
+            if ($val > 0) {
+                $okDays++;
             }
 
             $cursor->addDay();
         }
 
-        return true;
+        return $totalDays > 0 && ($okDays / $totalDays) >= 0.6;
     }
 
-    private function pickPriceRow(int $roomId, Carbon $from, Carbon $to, int $adults, int $children): ?RoomPrice
+    private function calculateTotalForRoom(int $roomId, Carbon $from, Carbon $to, int $adults, int $children): float
     {
-        $q = RoomPrice::query()
-            ->where('room_id', $roomId)
-            ->whereDate('date_from', '<=', $from->toDateString())
-            ->whereDate('date_to', '>=', $to->copy()->subDay()->toDateString());
-
-        $exact = (clone $q)
-            ->where('adults', $adults)
-            ->where('children', $children)
-            ->orderByDesc('is_default')
-            ->first();
-
-        if ($exact) {
-            return $exact;
+        $rows = $this->getPriceRowsForRoom($roomId);
+        if ($rows->isEmpty()) {
+            return 0.0;
         }
 
-        return (clone $q)
-            ->orderByDesc('is_default')
-            ->first();
-    }
-
-    private function calculateTotal(RoomPrice $price, Carbon $from, Carbon $to): float
-    {
         $total = 0.0;
-
         $cursor = $from->copy();
-        while ($cursor->lt($to)) {
-            $day = strtolower($cursor->format('D')); // mon,tue,wed...
-            $value = (float) ($price->{$day} ?? 0);
 
-            if ($value <= 0) {
+        while ($cursor->lt($to)) {
+            $priceRow = $this->bestPriceRowForDay($rows, $cursor, $adults, $children);
+            if (! $priceRow) {
                 return 0.0;
             }
 
-            $total += $value;
+            $dayKey = strtolower($cursor->format('D')); // mon..sun
+            $val = (float) ($priceRow->{$dayKey} ?? 0);
+
+            if ($val <= 0) {
+                return 0.0;
+            }
+
+            $total += $val;
             $cursor->addDay();
         }
 
         return $total;
     }
 
+    private function bestPriceRowForDay(Collection $rows, Carbon $day, int $adults, int $children): ?RoomPrice
+    {
+        $m = (int) $day->month;
+        $d = (int) $day->day;
+
+        $candidates = $rows->filter(function (RoomPrice $r) use ($m, $d) {
+            $from = Carbon::parse($r->date_from);
+            $to   = Carbon::parse($r->date_to);
+
+            $fm = (int) $from->month; $fd = (int) $from->day;
+            $tm = (int) $to->month;   $td = (int) $to->day;
+
+            // normal interval
+            if ($fm < $tm || ($fm === $tm && $fd <= $td)) {
+                if ($m < $fm || ($m === $fm && $d < $fd)) return false;
+                if ($m > $tm || ($m === $tm && $d > $td)) return false;
+                return true;
+            }
+
+            // wrap-around (sezona prelazi godinu)
+            $inEnd   = ($m > $fm) || ($m === $fm && $d >= $fd);
+            $inStart = ($m < $tm) || ($m === $tm && $d <= $td);
+            return $inEnd || $inStart;
+        });
+
+        if ($candidates->isEmpty()) {
+            return null;
+        }
+
+        $exact = $candidates
+            ->where('adults', $adults)
+            ->where('children', $children)
+            ->sortByDesc(fn ($r) => (int) ($r->is_default ?? 0))
+            ->first();
+
+        if ($exact) return $exact;
+
+        return $candidates
+            ->sortByDesc(fn ($r) => (int) ($r->is_default ?? 0))
+            ->first();
+    }
+
+    private function getPriceRowsForRoom(int $roomId): Collection
+    {
+        if (isset($this->pricesCache[$roomId])) {
+            return $this->pricesCache[$roomId];
+        }
+
+        $rows = RoomPrice::query()
+            ->where('room_id', $roomId)
+            ->get();
+
+        return $this->pricesCache[$roomId] = $rows;
+    }
+
     private function clean(?string $v): ?string
     {
         $v = trim((string) $v);
-
         return $v !== '' ? $v : null;
     }
 
     /**
-     * ✅ Alias da ne puca ViewInquiry kad zove fallbackAlternatives()
-     * (da ne gomilamo nove metode - samo preusmerenje).
+     * Ručni aliasi (nije obavezno, ali ostavi za “poznate” slučajeve)
      */
-    public function fallbackAlternatives(Inquiry $inquiry, int $limit = 5): Collection
+    private function locationAliases(): array
     {
-        return $this->findFallbackAlternatives($inquiry, $limit);
-    }
-
-    /**
-     * ✅ Fallback bez hardkodovanja:
-     * pokušava “relaxed” varijante i vraća candidates (hotel+room+price).
-     *
-     * Redosled:
-     * 1) region bez mesta (ako postoji region)
-     * 2) globalno (bez region/location)
-     * 3) fleks datumi ±1..±3 dana (isti broj noćenja), globalno
-     * 4) opusti budžet (globalno)
-     */
-    public function findFallbackAlternatives(Inquiry $inquiry, int $limit = 5): Collection
-    {
-        if (! $inquiry->date_from || ! $inquiry->date_to || ! $inquiry->adults) {
-            return collect();
-        }
-
-        $from = Carbon::parse($inquiry->date_from)->startOfDay();
-        $to   = Carbon::parse($inquiry->date_to)->startOfDay();
-
-        $nights = (int) ($inquiry->nights ?: $from->diffInDays($to));
-        if ($nights <= 0) {
-            return collect();
-        }
-
-        $adults   = (int) $inquiry->adults;
-        $children = (int) ($inquiry->children ?: 0);
-
-        $log = [
-            'input'  => ['fallback' => true],
-            'reason' => null,
-            'steps'  => [],
+        return [
+            'jerisos' => ['ierissos', 'ierissos, athos', 'ierissos athos'],
         ];
-
-        // 1) Region bez mesta
-        if ($this->clean($inquiry->region)) {
-            $r1 = $this->runMatch(
-                inquiry: $this->cloneInquiry($inquiry, ['location' => null]),
-                from: $from,
-                to: $to,
-                nights: $nights,
-                adults: $adults,
-                children: $children,
-                limit: $limit,
-                strictLocation: false,
-                regionOverride: $this->clean($inquiry->region),
-                log: $log
-            );
-
-            if ($r1->isNotEmpty()) {
-                return $r1->take($limit)->values();
-            }
-        }
-
-        // 2) Globalno (bez region/location) – ista pravila za sobe/cene/availability
-        $r2 = $this->runMatch(
-            inquiry: $this->cloneInquiry($inquiry, ['region' => null, 'location' => null]),
-            from: $from,
-            to: $to,
-            nights: $nights,
-            adults: $adults,
-            children: $children,
-            limit: $limit,
-            strictLocation: false,
-            regionOverride: null,
-            log: $log
-        );
-
-        if ($r2->isNotEmpty()) {
-            return $r2->take($limit)->values();
-        }
-
-        // 3) Fleks datumi ±1..±3 (isti nights), globalno
-        foreach ([1, 2, 3, -1, -2, -3] as $shift) {
-            $f = $from->copy()->addDays($shift);
-            $t = $f->copy()->addDays($nights);
-
-            $r3 = $this->runMatch(
-                inquiry: $this->cloneInquiry($inquiry, ['region' => null, 'location' => null]),
-                from: $f,
-                to: $t,
-                nights: $nights,
-                adults: $adults,
-                children: $children,
-                limit: $limit,
-                strictLocation: false,
-                regionOverride: null,
-                log: $log
-            );
-
-            if ($r3->isNotEmpty()) {
-                return $r3->take($limit)->values();
-            }
-        }
-
-        // 4) Opusti budžet (globalno)
-        $r4 = $this->runMatch(
-            inquiry: $this->cloneInquiry($inquiry, [
-                'region'     => null,
-                'location'   => null,
-                'budget_min' => null,
-                'budget_max' => null,
-            ]),
-            from: $from,
-            to: $to,
-            nights: $nights,
-            adults: $adults,
-            children: $children,
-            limit: $limit,
-            strictLocation: false,
-            regionOverride: null,
-            log: $log
-        );
-
-        return $r4->take($limit)->values();
     }
 
     /**
-     * Kloniramo inquiry samo u memoriji (ne diramo DB),
-     * da možemo da testiramo različite “relaxed” kombinacije.
+     * “Rešenje za celu Grčku”:
+     * Pokušaj da nađeš canonical location_id i canonical tekstove iz pt_locations.
+     *
+     * Vraca:
+     * [
+     *   'location_id' => int|null,
+     *   'canonical'   => [strings...],   // location/title/h1/region/link...
+     *   'matched_by'  => 'exact'|'like'|null,
+     * ]
      */
-    private function cloneInquiry(Inquiry $inquiry, array $patch): Inquiry
+    private function resolveLocationFromDb(?string $loc): array
     {
-        $x = $inquiry->replicate(); // ne čuva u bazu
-        foreach ($patch as $k => $v) {
-            $x->{$k} = $v;
+        $loc = $this->clean($loc);
+        if (! $loc) {
+            return ['location_id' => null, 'canonical' => [], 'matched_by' => null];
         }
 
-        return $x;
+        $needleRaw = trim($loc);
+        $needle = mb_strtolower($needleRaw);
+
+        // zaštita: prekratko = previše šuma
+        if (mb_strlen($needle) < 3) {
+            return ['location_id' => null, 'canonical' => [], 'matched_by' => 'too_short'];
+        }
+
+        // probaj i slug varijantu: "Ierissos, Athos" -> "ierissos-athos"
+        $slug = Str::of($needle)
+            ->replace([',', '.', ';', ':'], ' ')
+            ->squish()
+            ->replace(' ', '-')
+            ->toString();
+
+        // 1) EXACT-ish (najpreciznije)
+        $row = DB::connection('grcka')->table('pt_locations')
+            ->select('id', 'location', 'title', 'h1', 'region', 'link', 'desc')
+            ->whereRaw('LOWER(link) = ?', [$needle])
+            ->orWhereRaw('LOWER(link) = ?', [$slug])
+            ->orWhereRaw('LOWER(location) = ?', [$needle])
+            ->orWhereRaw('LOWER(title) = ?', [$needle])
+            ->orWhereRaw('LOWER(h1) = ?', [$needle])
+            ->first();
+
+        if ($row) {
+            return [
+                'location_id' => (int) $row->id,
+                'canonical'   => $this->canonicalStringsFromLocationRow($row),
+                'matched_by'  => 'exact',
+            ];
+        }
+
+        // 2) LIKE (kontrolisano) – uzmi top 1, ali izvuci canonical stringove
+        $row2 = DB::connection('grcka')->table('pt_locations')
+            ->select('id', 'location', 'title', 'h1', 'region', 'link', 'desc')
+            ->where(function ($q) use ($needle) {
+                foreach (self::$locationTextColumns as $col) {
+                    $q->orWhereRaw("LOWER($col) LIKE ?", ["%{$needle}%"]);
+                }
+            })
+            // “bolji” pogodak: preferiraj kraći link i da počinje needle-om
+            ->orderByRaw('CASE WHEN LOWER(link) LIKE ? THEN 0 ELSE 1 END', ["{$needle}%"])
+            ->orderByRaw('LENGTH(link) ASC')
+            ->limit(1)
+            ->first();
+
+        if ($row2) {
+            return [
+                'location_id' => (int) $row2->id,
+                'canonical'   => $this->canonicalStringsFromLocationRow($row2),
+                'matched_by'  => 'like',
+            ];
+        }
+
+        return ['location_id' => null, 'canonical' => [], 'matched_by' => null];
+    }
+
+    private function canonicalStringsFromLocationRow(object $row): array
+    {
+        $out = [];
+
+        foreach (['location','title','h1','region','link','desc'] as $k) {
+            $v = trim((string) ($row->{$k} ?? ''));
+            if ($v !== '') {
+                $out[] = $v;
+
+                // link tokeni: ierissos-athos => "ierissos athos", ["ierissos","athos"]
+                if ($k === 'link') {
+                    $out[] = str_replace('-', ' ', $v);
+                    foreach (array_filter(explode('-', $v)) as $p) {
+                        $out[] = $p;
+                    }
+                }
+            }
+        }
+
+        // normalize
+        $out = array_map(fn ($s) => trim((string) $s), $out);
+        $out = array_filter($out, fn ($s) => $s !== '');
+        $out = array_unique($out);
+
+        return array_values($out);
+    }
+
+    /**
+     * Vrati needle-ove: original + aliasi + canonical iz DB + token varijante.
+     * $canonicalFromDb (ako je već resolved) prosledimo da ne radimo dupli DB lookup.
+     */
+    private function expandLocationNeedles(?string $loc, array $canonicalFromDb = []): array
+    {
+        $loc = $this->clean($loc);
+        if (! $loc) return [];
+
+        $base = trim($loc);
+        $out  = [$base];
+
+        // 1) ručni aliasi (opciono)
+        $t = mb_strtolower($base);
+        $aliases = $this->locationAliases();
+        if (isset($aliases[$t])) {
+            foreach ($aliases[$t] as $a) {
+                $out[] = $a;
+            }
+        }
+
+        // 2) canonical iz DB (ako postoji)
+        foreach ($canonicalFromDb as $c) {
+            $out[] = $c;
+        }
+
+        // 3) tokenizacija: razbij na delove (zarez, crtica, slash)
+        foreach ($this->tokenizeLocation($base) as $tok) {
+            $out[] = $tok;
+        }
+
+        // 4) ukloni navodnike/čudne apostrofe
+        $out[] = str_replace(['’', "'", '"'], '', $base);
+
+        // 5) normalize + dedupe + remove too short
+        $out = array_map(fn ($s) => trim((string) $s), $out);
+        $out = array_filter($out, fn ($s) => $s !== '');
+        $out = array_unique($out);
+        $out = array_filter($out, fn ($s) => mb_strlen($s) >= 3);
+
+        return array_values($out);
+    }
+
+    private function tokenizeLocation(string $s): array
+    {
+        $s = mb_strtolower(trim($s));
+        if ($s === '') return [];
+
+        // zameni separatore u space
+        $s = str_replace([',', ';', '/', '\\', '|', '.', ':', '(', ')', '[', ']', '{', '}', "\n", "\r", "\t"], ' ', $s);
+        $s = str_replace(['-', '_'], ' ', $s);
+        $s = preg_replace('/\s+/', ' ', $s) ?: $s;
+        $s = trim($s);
+
+        $parts = array_filter(explode(' ', $s));
+
+        // dodaj i “skupi” oblik bez space (nekad pomaže)
+        $out = [];
+        foreach ($parts as $p) {
+            $out[] = $p;
+        }
+
+        if (count($parts) >= 2) {
+            $out[] = implode(' ', $parts);
+        }
+
+        return array_values(array_unique(array_filter($out)));
     }
 }
