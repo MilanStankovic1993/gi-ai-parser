@@ -46,12 +46,18 @@ class InquiryOfferDraftBuilder
             foreach ($top as $idx => $c) {
                 $n = $idx + 1;
 
-                $hotelTitle = data_get($c, 'hotel.hotel_title') ?? data_get($c, 'hotel.title') ?? data_get($c, 'name') ?? 'Smeštaj';
-                $location = data_get($c, 'hotel.mesto') ?? data_get($c, 'location') ?? ($inquiry->location ?? null);
+                $hotelTitle = data_get($c, 'hotel.hotel_title')
+                    ?? data_get($c, 'hotel.title')
+                    ?? data_get($c, 'name')
+                    ?? 'Smeštaj';
+
+                $location = data_get($c, 'hotel.mesto')
+                    ?? data_get($c, 'location')
+                    ?? ($inquiry->location ?? null);
 
                 $roomTitle = data_get($c, 'room.room_title') ?? data_get($c, 'type') ?? null;
 
-                $total = data_get($c, 'price.total');
+                $total  = data_get($c, 'price.total');
                 $nights = data_get($c, 'price.nights') ?? $inquiry->nights;
 
                 $priceText = $total !== null ? $this->money($total) : null;
@@ -74,7 +80,7 @@ class InquiryOfferDraftBuilder
         }
 
         $questions = is_array($inquiry->questions) ? $inquiry->questions : [];
-        if (!empty($questions)) {
+        if (! empty($questions)) {
             $lines[] = "Napomena:";
             if (in_array('deposit', $questions, true) || in_array('payment', $questions, true)) {
                 $lines[] = "• Visina depozita i uslovi plaćanja zavise od izabranog smeštaja — nakon što potvrdite opciju, proveravamo i šaljemo tačne informacije.";
@@ -97,10 +103,26 @@ class InquiryOfferDraftBuilder
 
     private function formatPeriod(Inquiry $i): ?string
     {
+        // exact
         if ($i->date_from && $i->date_to) {
             return $i->date_from->format('d.m.Y') . " – " . $i->date_to->format('d.m.Y');
         }
+
+        // window (NEW)
+        $wf = data_get($i, 'travel_time.date_window.from');
+        $wt = data_get($i, 'travel_time.date_window.to');
+        $n  = (int) (data_get($i, 'travel_time.nights') ?: ($i->nights ?? 0));
+
+        if ($wf && $wt) {
+            $from = \Carbon\Carbon::parse($wf)->format('d.m.Y');
+            $to   = \Carbon\Carbon::parse($wt)->format('d.m.Y');
+            return $n > 0
+                ? "{$from} – {$to} (fleksibilno, {$n} noćenja)"
+                : "{$from} – {$to} (fleksibilno)";
+        }
+
         if ($i->month_hint) return (string) $i->month_hint;
+
         return null;
     }
 

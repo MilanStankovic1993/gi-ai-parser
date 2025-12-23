@@ -48,9 +48,20 @@ Ti si asistent za GrckaInfo. Iz poruke gosta izvuci parametre kao "kandidate" (n
 Vrati ISKLJUČIVO validan JSON (bez objašnjenja, bez markdown-a).
 
 OBAVEZNO:
-- property_candidates: niz naziva smeštaja (ako gost pominje), svaki element: { "query": string, "confidence": 0..1 }
-- location_candidates: niz mesta/oblasti (sr/en/gr kako god gost napise), { "query": string, "confidence": 0..1 }
+- property_candidates: niz naziva smeštaja (ako gost pominje), { "query": string, "confidence": 0..1 }
+- location_candidates: niz mesta/oblasti (kako god gost napiše), { "query": string, "confidence": 0..1 }
 - region_candidates: niz regija (ako postoje), { "query": string, "confidence": 0..1 }
+
+- location_json: objekat za "najširu pretragu":
+  {
+    "primary":   [ { "query": string, "confidence": 0..1 } ],
+    "fallback":  [ { "query": string, "confidence": 0..1 } ],
+    "notes":     string|null
+  }
+  Pravilo:
+  - Ako gost navodi više lokacija / opseg (npr "od Nikitija do Toronija" + "sa druge strane Vourvuru do Sartija"),
+    ubaci sve u primary (redosled po verovatnoći), a fallback neka bude prazno ili šire varijante.
+
 - date_candidates: niz kandidata za period:
   - ili { "from":"YYYY-MM-DD", "to":"YYYY-MM-DD", "confidence":0..1 }
   - ili { "from_window":{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}, "nights":int|null, "confidence":0..1 }
@@ -69,35 +80,29 @@ OBAVEZNO:
     "confidence": 0..1
   }
 
-✅ KLJUČNO (DA BI SE RADILE ODVOJENE PRETRAGE):
+✅ KLJUČNO (ODVOJENE PRETRAGE):
 - units: niz (jedan element = jedna porodica/jedinica/apartman koji tražimo)
-  Svaki element:
   {
     "unit_index": int,  // 1..N
-    "party_group": {
-      "adults": int|null,
-      "children": int|null,
-      "children_ages": int[],
-      "requirements": string[]
-    },
+    "party_group": { "adults":int|null, "children":int|null, "children_ages":int[], "requirements":string[] },
     "property_candidates": [ { "query": string, "confidence": 0..1 } ],
     "wishes_override": {near_beach, parking, quiet, pets, pool, separate_bedroom} true/false/null | null
   }
 
 PRAVILO MAPIRANJA:
-- Ako party.groups ima N elemenata i property_candidates ima N elemenata, OBAVEZNO:
+- Ako party.groups ima N elemenata i property_candidates ima N elemenata:
   - units.length = N
   - units[i].party_group = party.groups[i]
   - units[i].property_candidates = [ property_candidates[i] ]
 - Ako nije jasno mapiranje: vrati units sa party_group, a property_candidates ostavi prazno ili kopiraj globalno.
 
 - wishes: tri-state {near_beach, parking, quiet, pets, pool, separate_bedroom} true/false/null
-- questions: niz tagova pitanja (deposit, guarantee, availability, price, payment, cancellation)
+- questions: niz tagova (deposit, guarantee, availability, price, payment, cancellation)
 - intent: specific_property | standard_search | long_stay_private | owner_request | spam | unknown
 - language: "sr" ili "en" (ili null)
 
 Kompatibilnost:
-- Popuni i legacy polja (region, location, date_from, date_to, nights, adults, children, children_ages, budget_min, budget_max, wants_*) na osnovu najboljeg kandidata.
+- Popuni i legacy polja (region, location, date_from, date_to, nights, adults, children, children_ages, budget_min, budget_max, wants_*)
 SYS;
 
         $user = <<<USR
@@ -113,6 +118,7 @@ out_of_scope_reason,
 property_candidates,
 location_candidates,
 region_candidates,
+location_json,
 date_candidates,
 
 party,
@@ -224,6 +230,20 @@ USR;
             $this->normalizeDateCandidates(data_get($data, 'date_candidates'))
         );
 
+        // location_json (kanon)
+        $locationJsonRaw = $this->normalizeObject(data_get($data, 'location_json'), []);
+        $locationJson = [
+            'primary'  => $this->sortCandidatesByConfidence($this->normalizeCandidateList($locationJsonRaw['primary'] ?? [])),
+            'fallback' => $this->sortCandidatesByConfidence($this->normalizeCandidateList($locationJsonRaw['fallback'] ?? [])),
+            'notes'    => $this->nullIfEmpty((string) ($locationJsonRaw['notes'] ?? '')),
+        ];
+
+        // ako AI nije dao location_json, napravi iz location_candidates
+        if (empty($locationJson['primary']) && ! empty($locationCandidates)) {
+            $locationJson['primary'] = $locationCandidates;
+            $warnings[] = 'location_json missing; derived primary from location_candidates';
+        }
+
         // party (groups)
         $partyRaw = $this->normalizeObject(data_get($data, 'party'), []);
 
@@ -244,7 +264,8 @@ USR;
 
             $agesFromLegacy = $this->normalizeAgesToArray(data_get($data, 'children_ages'));
             if (! empty($agesFromLegacy)) {
-                $ages = array_values(array_unique(array_merge($ages, $agesFromLegacy)));
+                // ✅ NE unique
+                $ages = array_values(array_merge($ages, $agesFromLegacy));
             }
 
             $groups = [[
@@ -263,7 +284,7 @@ USR;
             'units_needed' => $unitsNeeded,
             'adults' => $adults,
             'children' => $children,
-            'children_ages' => $ages,
+            'children_ages' => $ages, // ✅ duplikati dozvoljeni
             'groups' => $groups,
             'confidence' => $partyConfidence,
         ];
@@ -287,7 +308,7 @@ USR;
         $budgetMax = $this->normalizeInt(data_get($data, 'budget_max'));
 
         // LEGACY best
-        $bestLoc = $locationCandidates[0]['query'] ?? $this->nullIfEmpty(data_get($data, 'location'));
+        $bestLoc = $locationJson['primary'][0]['query'] ?? $locationCandidates[0]['query'] ?? $this->nullIfEmpty(data_get($data, 'location'));
         $bestReg = $regionCandidates[0]['query'] ?? $this->nullIfEmpty(data_get($data, 'region'));
 
         $bestDateFrom = $this->normalizeDate(data_get($data, 'date_from'));
@@ -370,7 +391,7 @@ USR;
             $wishes
         );
 
-        if (empty($units) && !empty($groups)) {
+        if (empty($units) && ! empty($groups)) {
             $warnings[] = 'units missing; built deterministically from party.groups and property_candidates';
         }
 
@@ -380,20 +401,14 @@ USR;
 
             'entities' => $entities,
             'travel_time' => $travelTime,
-
             'party' => $party,
-            'units' => $units, // ✅
+            'location_json' => $locationJson,
+            'units' => $units,
 
             'wishes' => $wishes,
             'questions' => $questions,
             'tags' => $tags,
             'why_no_offer' => $why,
-
-            // dodatno
-            'property_candidates' => $propertyCandidates,
-            'location_candidates' => $locationCandidates,
-            'region_candidates'   => $regionCandidates,
-            'date_candidates'     => $dateCandidates,
 
             'budget_min' => $budgetMin,
             'budget_max' => $budgetMax,
@@ -409,7 +424,7 @@ USR;
 
             'adults' => $adults,
             'children' => $children,
-            'children_ages' => $ages,
+            'children_ages' => $ages, // ✅ duplikati dozvoljeni
 
             'wants_near_beach' => $wantsNear,
             'wants_parking'    => $wantsPark,
@@ -423,28 +438,20 @@ USR;
         return [$out, $warnings];
     }
 
-    /**
-     * units:
-     * - ako AI da validno -> normalizuj
-     * - ako ne -> deterministički:
-     *   - ako groups N i propertyCandidates N -> 1:1 map
-     *   - else -> units iz groups, propertyCandidates prazno (ili global kopija)
-     */
     private function normalizeUnits($v, array $groups, array $propertyCandidates, array $wishes): array
     {
-        // 1) ako AI vrati units
         if (is_string($v)) {
             $decoded = json_decode($v, true);
             $v = is_array($decoded) ? $decoded : null;
         }
 
-        if (is_array($v) && !empty($v)) {
+        if (is_array($v) && ! empty($v)) {
             $out = [];
             $i = 0;
 
             foreach ($v as $row) {
                 $i++;
-                if (!is_array($row)) continue;
+                if (! is_array($row)) continue;
 
                 $unitIndex = $this->normalizeInt($row['unit_index'] ?? $i) ?? $i;
 
@@ -454,7 +461,7 @@ USR;
                 $partyGroup = [
                     'adults' => $this->normalizeInt($pg['adults'] ?? null),
                     'children' => $this->normalizeInt($pg['children'] ?? null),
-                    'children_ages' => $this->normalizeAgesToArray($pg['children_ages'] ?? null),
+                    'children_ages' => $this->normalizeAgesToArray($pg['children_ages'] ?? null), // ✅ NE unique
                     'requirements' => $this->normalizeStringArray($pg['requirements'] ?? []),
                 ];
 
@@ -479,19 +486,15 @@ USR;
                 ];
             }
 
-            // ako je prazno posle normalizacije -> padni na deterministic
-            if (!empty($out)) {
-                return $out;
-            }
+            if (! empty($out)) return $out;
         }
 
-        // 2) deterministički fallback
+        // deterministički fallback
         $out = [];
 
         $gN = count($groups);
         $pN = count($propertyCandidates);
 
-        // N==N -> 1:1 map (tvoj scenario)
         if ($gN > 0 && $pN > 0 && $gN === $pN) {
             for ($i = 0; $i < $gN; $i++) {
                 $out[] = [
@@ -502,14 +505,13 @@ USR;
                         'children_ages' => $groups[$i]['children_ages'] ?? [],
                         'requirements' => $groups[$i]['requirements'] ?? [],
                     ],
-                    'property_candidates' => [ $propertyCandidates[$i] ],
+                    'property_candidates' => [$propertyCandidates[$i]],
                     'wishes_override' => null,
                 ];
             }
             return $out;
         }
 
-        // samo groups
         if ($gN > 0) {
             for ($i = 0; $i < $gN; $i++) {
                 $out[] = [
@@ -520,7 +522,6 @@ USR;
                         'children_ages' => $groups[$i]['children_ages'] ?? [],
                         'requirements' => $groups[$i]['requirements'] ?? [],
                     ],
-                    // ako nema mapiranja, ostavi prazno (ili kopiraj globalno ako želiš)
                     'property_candidates' => [],
                     'wishes_override' => null,
                 ];
@@ -528,7 +529,6 @@ USR;
             return $out;
         }
 
-        // nema ničega
         return [];
     }
 
@@ -560,7 +560,7 @@ USR;
             $out[] = ['query' => $q, 'confidence' => $c];
         }
 
-        // unique by query
+        // unique by query (OK za lokacije/nazive)
         $uniq = [];
         foreach ($out as $r) {
             $k = mb_strtolower($r['query']);
@@ -747,6 +747,9 @@ USR;
         return $v === '' ? null : $v;
     }
 
+    /**
+     * ✅ ages: NE unique, valid 0..17 (0 = beba)
+     */
     private function normalizeAgesToArray($v): array
     {
         if ($v === null) return [];
@@ -766,10 +769,12 @@ USR;
         $ages = [];
         foreach ($v as $item) {
             $n = $this->normalizeInt($item);
-            if ($n !== null && $n >= 0 && $n <= 25) $ages[] = $n;
+            if ($n !== null && $n >= 0 && $n <= 17) {
+                $ages[] = $n; // ✅ NE unique
+            }
         }
 
-        return array_values(array_unique($ages));
+        return array_values($ages);
     }
 
     private function normalizePartyGroups($v): array
@@ -825,6 +830,9 @@ USR;
         }));
     }
 
+    /**
+     * ✅ totals: children_ages NE unique
+     */
     private function derivePartyTotalsFromGroups(array $groups): array
     {
         $adults = 0;
@@ -851,17 +859,15 @@ USR;
             if (is_array($a)) {
                 foreach ($a as $age) {
                     $n = $this->normalizeInt($age);
-                    if ($n !== null && $n >= 0 && $n <= 25) $ages[] = $n;
+                    if ($n !== null && $n >= 0 && $n <= 17) $ages[] = $n; // ✅ NE unique
                 }
             }
         }
 
-        $ages = array_values(array_unique($ages));
-
         return [
             $hasAdults ? $adults : null,
             $hasChildren ? $children : null,
-            $ages,
+            array_values($ages),
         ];
     }
 
@@ -922,6 +928,11 @@ USR;
             'wishes_override' => null,
         ];
 
+        $locPrimary = [];
+        if (! empty($inquiry->location)) {
+            $locPrimary[] = ['query' => (string) $inquiry->location, 'confidence' => null];
+        }
+
         return [
             'intent' => 'standard_search',
             'out_of_scope_reason' => null,
@@ -939,11 +950,6 @@ USR;
                 'nights' => $inquiry->nights,
             ],
 
-            'property_candidates' => [],
-            'location_candidates' => [],
-            'region_candidates' => [],
-            'date_candidates' => [],
-
             'party' => [
                 'units_needed' => null,
                 'adults' => $inquiry->adults,
@@ -958,7 +964,13 @@ USR;
                 'confidence' => null,
             ],
 
-            'units' => [$unit], // ✅
+            'location_json' => [
+                'primary' => $locPrimary,
+                'fallback' => [],
+                'notes' => null,
+            ],
+
+            'units' => [$unit],
 
             'wishes' => [
                 'near_beach' => null,

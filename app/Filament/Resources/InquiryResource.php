@@ -4,6 +4,7 @@ namespace App\Filament\Resources;
 
 use App\Filament\Resources\InquiryResource\Pages;
 use App\Models\Inquiry;
+use App\Services\InquiryMissingData;
 use Filament\Forms\Form;
 use Filament\Resources\Resource;
 use Filament\Tables;
@@ -66,6 +67,11 @@ class InquiryResource extends Resource
                     \Filament\Forms\Components\DatePicker::make('date_to')
                         ->label('Datum do'),
 
+                    \Filament\Forms\Components\TextInput::make('nights')
+                        ->label('Broj noćenja')
+                        ->numeric()
+                        ->minValue(0),
+
                     \Filament\Forms\Components\TextInput::make('adults')
                         ->label('Odrasli')
                         ->numeric()
@@ -76,6 +82,7 @@ class InquiryResource extends Resource
                         ->numeric()
                         ->minValue(0),
 
+                    // ✅ SOURCE OF TRUTH: InquiryMissingData::normalizeChildrenAges (NE unique, 1-17)
                     \Filament\Forms\Components\TextInput::make('children_ages')
                         ->label('Uzrast dece (npr: 5 ili 5, 8)')
                         ->maxLength(255)
@@ -86,28 +93,7 @@ class InquiryResource extends Resource
                             return is_string($state) ? $state : null;
                         })
                         ->dehydrateStateUsing(function ($state) {
-                            if ($state === null) {
-                                return [];
-                            }
-                            if (is_array($state)) {
-                                return array_values($state);
-                            }
-
-                            $txt = trim((string) $state);
-                            if ($txt === '') {
-                                return [];
-                            }
-
-                            $parts = preg_split('/[,\s;]+/', $txt) ?: [];
-                            $nums = [];
-                            foreach ($parts as $p) {
-                                $n = preg_replace('/\D+/', '', (string) $p);
-                                if ($n !== '') {
-                                    $nums[] = (int) $n;
-                                }
-                            }
-
-                            return array_values(array_unique(array_filter($nums, fn ($n) => $n >= 0 && $n <= 17)));
+                            return InquiryMissingData::normalizeChildrenAges($state) ?? [];
                         }),
 
                     \Filament\Forms\Components\TextInput::make('budget_min')
@@ -146,6 +132,7 @@ class InquiryResource extends Resource
                             'suggested'  => 'Suggested',
                             'replied'    => 'Replied',
                             'closed'     => 'Closed',
+                            'no_ai'      => 'Bez AI obrade',
                         ])
                         ->default('new'),
 
@@ -202,6 +189,7 @@ class InquiryResource extends Resource
                         'needs_info' => 'danger',
                         'suggested'  => 'info',
                         'replied'    => 'success',
+                        'no_ai'      => 'secondary',
                         'closed'     => 'secondary',
                     ])
                     ->formatStateUsing(fn ($state) => match ($state) {
@@ -210,6 +198,7 @@ class InquiryResource extends Resource
                         'needs_info' => 'Needs info',
                         'suggested'  => 'Suggested',
                         'replied'    => 'Replied',
+                        'no_ai'      => 'Bez AI obrade',
                         'closed'     => 'Closed',
                         default      => (string) $state,
                     })
@@ -236,6 +225,7 @@ class InquiryResource extends Resource
                         'needs_info' => 'Needs info',
                         'suggested'  => 'Suggested',
                         'replied'    => 'Replied',
+                        'no_ai'      => 'Bez AI obrade',
                         'closed'     => 'Closed',
                     ]),
 
@@ -253,14 +243,14 @@ class InquiryResource extends Resource
             ->actions([
                 Tables\Actions\ViewAction::make()->label('Open')->icon('heroicon-o-eye'),
 
-                // ✅ Quick edit modal koji UVEK povuče fresh podatke + children_ages kao string
+                // ✅ Quick edit modal: fresh record + children_ages string; save uses normalizeChildrenAges (NE unique)
                 Tables\Actions\EditAction::make()
                     ->label('Quick edit')
                     ->icon('heroicon-o-pencil-square')
                     ->fillForm(function (Inquiry $record) {
                         $r = $record->fresh();
-
                         $arr = $r->toArray();
+
                         $arr['children_ages'] = is_array($r->children_ages)
                             ? implode(', ', $r->children_ages)
                             : (is_string($r->children_ages) ? $r->children_ages : '');
@@ -268,18 +258,9 @@ class InquiryResource extends Resource
                         return $arr;
                     })
                     ->mutateFormDataUsing(function (array $data) {
-                        // safety: children_ages nekad dođe kao string iz modala
-                        if (isset($data['children_ages']) && is_string($data['children_ages'])) {
-                            $txt = trim($data['children_ages']);
-                            $parts = $txt === '' ? [] : (preg_split('/[,\s;]+/', $txt) ?: []);
-                            $nums = [];
-                            foreach ($parts as $p) {
-                                $n = preg_replace('/\D+/', '', (string) $p);
-                                if ($n !== '') $nums[] = (int) $n;
-                            }
-                            $data['children_ages'] = array_values(array_unique(array_filter($nums, fn ($n) => $n >= 0 && $n <= 17)));
+                        if (array_key_exists('children_ages', $data)) {
+                            $data['children_ages'] = InquiryMissingData::normalizeChildrenAges($data['children_ages']) ?? [];
                         }
-
                         return $data;
                     }),
             ])

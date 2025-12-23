@@ -34,7 +34,7 @@ class InquiryMissingData
 
         $dateFrom  = $travel['date_from'] ?? ($i->date_from ? $i->date_from->toDateString() : null);
         $dateTo    = $travel['date_to']   ?? ($i->date_to ? $i->date_to->toDateString() : null);
-        $monthHint = $travel['month_hint'] ?? ($i->month_hint ?: null);
+        // $monthHint = $travel['month_hint'] ?? ($i->month_hint ?: null);
 
         // ✅ Dates gate: exact OR window+nights
         $hasExactDates = filled($i->date_from) && (filled($i->date_to) || (int) $i->nights > 0);
@@ -71,7 +71,6 @@ class InquiryMissingData
         // Heuristic: da li poruka pominje decu i uzrast (kada nema strukturiranih podataka)
         $mentionsKids = Str::contains($text, [
             'dete', 'deca', 'djeca', 'klinac', 'klinci', 'beba', 'baby',
-            'godina', 'god', 'uzrast',
         ]);
 
         // Ako imamo grupe: validacija po grupama
@@ -102,6 +101,12 @@ class InquiryMissingData
                         $missingAgesForGroups = true;
                     }
                 }
+            }
+
+            if ($hasAdultsSomewhere && ! $hasAnyChildren && ! $mentionsKids) {
+                // samo preskoči kids validaciju, ali nastavi dalje
+                // (ovde u groups grani svakako vraćaš rezultat, pa je ok return)
+                return array_values(array_unique(array_filter($missing)));
             }
 
             if (! $hasAdultsSomewhere) {

@@ -37,6 +37,7 @@ class Inquiry extends Model
         'entities',
         'travel_time',
         'party',
+        'location_json',
         'units',
         'wishes',
         'questions',
@@ -79,9 +80,11 @@ class Inquiry extends Model
 
     protected $casts = [
         // canonical contract
+        'intent'           => 'string',
         'entities'         => 'array',
         'travel_time'      => 'array',
         'party'            => 'array',
+        'location_json'    => 'array',
         'units'            => 'array',
         'wishes'           => 'array',
         'questions'        => 'array',
@@ -96,16 +99,29 @@ class Inquiry extends Model
         'date_from'        => 'date',
         'date_to'          => 'date',
 
-        // flags: NE CASTUJ boolean (da null ostane null)
-        // 'wants_near_beach' => 'boolean',
-        // 'wants_parking'    => 'boolean',
-        // 'wants_quiet'      => 'boolean',
-        // 'wants_pets'       => 'boolean',
-        // 'wants_pool'       => 'boolean',
+        // flags: NE castujemo u boolean da null ostane null
 
+        'language'         => 'string',
         'is_priority'      => 'boolean',
         'received_at'      => 'datetime',
         'processed_at'     => 'datetime',
+    ];
+
+    /**
+     * Stabilni default-i (da UI/servisi mogu bezbedno da rade sa ?? [] bez JSON string defaulta u DB).
+     */
+    protected $attributes = [
+        'intent'           => null,
+        'entities'         => null,
+        'travel_time'      => null,
+        'party'            => null,
+        'location_json'    => null,
+        'units'            => null,
+        'wishes'           => null,
+        'questions'        => null,
+        'tags'             => null,
+        'why_no_offer'     => null,
+        'extraction_debug' => null,
     ];
 
     public function aiInquiry(): HasOne

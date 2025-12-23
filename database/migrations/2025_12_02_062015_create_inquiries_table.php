@@ -15,6 +15,7 @@ return new class extends Migration
             $table->string('source', 255)->default('email');
 
             // Stabilan ID za dedupe (ai:source:message_id/hash)
+            // Napomena: nullable+unique je OK u MySQL/Postgres; ingest mora obavezno da popuni external_id za email source.
             $table->string('external_id', 255)->nullable()->unique();
 
             // Podaci o gostu
@@ -32,18 +33,18 @@ return new class extends Migration
             $table->longText('ai_draft')->nullable();
 
             /**
-             * ŠIRA SLIKA (kanonski contract za extraction + search)
-             * Ovo je “izvor istine” za sve realne scenarije mailova.
+             * KANONSKI CONTRACT (Faza 1)
              */
-            $table->string('intent', 50)->nullable()->index();     // specific_property|standard_search|long_stay_private|owner_request|spam|unknown
-            $table->json('entities')->nullable();                  // [{type, value, url, confidence}, ...]
-            $table->json('travel_time')->nullable();               // {date_from/date_to OR date_window, nights_min/max, stay_type, confidence}
-            $table->json('party')->nullable();                     // {adults, children, ages, groups, units_requested, room_notes, confidence}
+            $table->string('intent', 50)->nullable()->index();
+            $table->json('entities')->nullable();
+            $table->json('travel_time')->nullable();
+            $table->json('party')->nullable();
+            $table->json('location_json')->nullable();
             $table->json('units')->nullable();
-            $table->json('wishes')->nullable();                    // tri-state flags: true/false/null
-            $table->json('questions')->nullable();                 // ["deposit","guarantee",...]
-            $table->json('tags')->nullable();                      // ["family","group","flexible",...]
-            $table->json('why_no_offer')->nullable();              // ["missing_dates","missing_party",...]
+            $table->json('wishes')->nullable();        // tri-state flags: true/false/null
+            $table->json('questions')->nullable();
+            $table->json('tags')->nullable();
+            $table->json('why_no_offer')->nullable();
 
             // Summary polja (AI popunjava) – ostavljamo za UI/filtere
             $table->string('region', 255)->nullable();
@@ -64,9 +65,7 @@ return new class extends Migration
             $table->unsignedInteger('budget_max')->nullable();
 
             /**
-             * Wants / flags – ostavljamo radi kompatibilnosti,
-             * ALI: u extractor/mapping logici mora da bude tri-state (true/false/null).
-             * Nikad ne upisivati false ako nije eksplicitno pomenuto.
+             * Wants / flags – tri-state (true/false/null). Ne upisivati false ako nije eksplicitno pomenuto.
              */
             $table->boolean('wants_near_beach')->nullable();
             $table->boolean('wants_parking')->nullable();
@@ -78,10 +77,10 @@ return new class extends Migration
             // Language (sr/en/...)
             $table->string('language', 10)->nullable();
 
-            // Status obrade (business status) — usklađeno sa modelom/komandama
+            // Status obrade (business status)
             $table->enum('status', [
                 'new',
-                'needs_info', // fali ključni podatak -> pitanja
+                'needs_info',
                 'extracted',
                 'suggested',
                 'replied',
