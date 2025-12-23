@@ -2,13 +2,12 @@
 
 namespace App\Models;
 
-use App\Services\InquiryMissingData;
-use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class Inquiry extends Model
 {
-    use HasFactory;
+    protected $table = 'inquiries';
 
     public const STATUS_NEW        = 'new';
     public const STATUS_NEEDS_INFO = 'needs_info';
@@ -17,6 +16,9 @@ class Inquiry extends Model
     public const STATUS_REPLIED    = 'replied';
     public const STATUS_CLOSED     = 'closed';
     public const STATUS_NO_AI      = 'no_ai';
+
+    public const REPLY_MODE_AI     = 'ai_draft';
+    public const REPLY_MODE_MANUAL = 'manual';
 
     protected $fillable = [
         'source',
@@ -30,19 +32,31 @@ class Inquiry extends Model
         'raw_message',
         'ai_draft',
 
+        // canonical contract
+        'intent',
+        'entities',
+        'travel_time',
+        'party',
+        'units',
+        'wishes',
+        'questions',
+        'tags',
+        'why_no_offer',
+
+        // summary
         'region',
         'location',
-        'month_hint',
         'date_from',
         'date_to',
+        'month_hint',
         'nights',
         'adults',
         'children',
         'children_ages',
-
         'budget_min',
         'budget_max',
 
+        // wants_* (tri-state)
         'wants_near_beach',
         'wants_parking',
         'wants_quiet',
@@ -50,121 +64,52 @@ class Inquiry extends Model
         'wants_pool',
         'special_requirements',
 
-        'extraction_mode',
-        'extraction_debug',
         'language',
 
         'status',
         'reply_mode',
-        'is_priority',
 
+        'extraction_mode',
+        'extraction_debug',
+
+        'is_priority',
         'received_at',
         'processed_at',
     ];
 
     protected $casts = [
-        'date_from'    => 'date',
-        'date_to'      => 'date',
+        // canonical contract
+        'entities'         => 'array',
+        'travel_time'      => 'array',
+        'party'            => 'array',
+        'units'            => 'array',
+        'wishes'           => 'array',
+        'questions'        => 'array',
+        'tags'             => 'array',
+        'why_no_offer'     => 'array',
 
-        'received_at'  => 'datetime',
-        'processed_at' => 'datetime',
-
-        'nights'     => 'integer',
-        'adults'     => 'integer',
-        'children'   => 'integer',
-        'budget_min' => 'integer',
-        'budget_max' => 'integer',
-
-        // DB kolone su json
-        'children_ages'    => 'array',
+        // meta/debug
         'extraction_debug' => 'array',
 
-        'wants_near_beach' => 'boolean',
-        'wants_parking'    => 'boolean',
-        'wants_quiet'      => 'boolean',
-        'wants_pets'       => 'boolean',
-        'wants_pool'       => 'boolean',
+        // summary
+        'children_ages'    => 'array',
+        'date_from'        => 'date',
+        'date_to'          => 'date',
 
-        'is_priority' => 'boolean',
+        // flags: NE CASTUJ boolean (da null ostane null)
+        // 'wants_near_beach' => 'boolean',
+        // 'wants_parking'    => 'boolean',
+        // 'wants_quiet'      => 'boolean',
+        // 'wants_pets'       => 'boolean',
+        // 'wants_pool'       => 'boolean',
+
+        'is_priority'      => 'boolean',
+        'received_at'      => 'datetime',
+        'processed_at'     => 'datetime',
     ];
 
-    protected $attributes = [
-        'status'      => self::STATUS_NEW,
-        'reply_mode'  => 'ai_draft',
-        'is_priority' => false,
-    ];
-
-    public function aiInquiry()
+    public function aiInquiry(): HasOne
     {
-        return $this->hasOne(AiInquiry::class, 'inquiry_id');
-    }
-
-    /**
-     * children_ages normalizacija:
-     * - null | "5,3" | "[5,3]" | ["5","3"] -> [5,3]
-     */
-    public function getChildrenAgesAttribute($value): array
-    {
-        return InquiryMissingData::normalizeChildrenAges($value);
-    }
-
-    public function setChildrenAgesAttribute($value): void
-    {
-        $normalized = InquiryMissingData::normalizeChildrenAges($value);
-
-        // Pošto je kolona json, najstabilnije je upisati JSON string.
-        // (Eloquent cast će svakako raditi, ali ovako izbegavamo edge slučajeve)
-        $this->attributes['children_ages'] = json_encode($normalized, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    }
-
-    public function setExtractionDebugAttribute($value): void
-    {
-        if ($value === null || $value === '') {
-            $this->attributes['extraction_debug'] = json_encode([], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            return;
-        }
-
-        if (is_string($value)) {
-            $decoded = json_decode($value, true);
-            $payload = is_array($decoded) ? $decoded : ['raw' => $value];
-
-            $this->attributes['extraction_debug'] = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-            return;
-        }
-
-        $payload = is_array($value) ? $value : (array) $value;
-
-        $this->attributes['extraction_debug'] = json_encode($payload, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
-    }
-
-    // Scopes
-    public function scopePriority($q)
-    {
-        return $q->where('is_priority', true);
-    }
-
-    public function scopeNew($q)
-    {
-        return $q->where('status', self::STATUS_NEW);
-    }
-
-    public function scopeNeedsInfo($q)
-    {
-        return $q->where('status', self::STATUS_NEEDS_INFO);
-    }
-
-    public function scopeNoAi($q)
-    {
-        return $q->where('status', self::STATUS_NO_AI);
-    }
-
-    public function scopeExtracted($q)
-    {
-        return $q->where('status', self::STATUS_EXTRACTED);
-    }
-
-    public function scopeSuggested($q)
-    {
-        return $q->where('status', self::STATUS_SUGGESTED);
+        return $this->hasOne(AiInquiry::class, 'inquiry_id', 'id');
     }
 }

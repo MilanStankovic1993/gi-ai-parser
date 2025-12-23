@@ -130,14 +130,27 @@ class AiParseInquiries extends Command
     private function fillFromExtractor(Inquiry $inquiry, array $out, bool $force): void
     {
         $set = function (string $field, $value) use ($inquiry, $force) {
-            if ($value === null || $value === '') {
-                return;
-            }
+            if ($value === null || $value === '') return;
             if ($force || $inquiry->{$field} === null || $inquiry->{$field} === '') {
                 $inquiry->{$field} = $value;
             }
         };
 
+        // ✅ intent + canonical blobs (ključ za date_window, groups, units)
+        $set('intent', $out['intent'] ?? null);
+
+        // Ova polja su casts=array u modelu
+        if ($force || empty($inquiry->entities))    $inquiry->entities    = is_array($out['entities'] ?? null) ? $out['entities'] : ($inquiry->entities ?? null);
+        if ($force || empty($inquiry->travel_time)) $inquiry->travel_time = is_array($out['travel_time'] ?? null) ? $out['travel_time'] : ($inquiry->travel_time ?? null);
+        if ($force || empty($inquiry->party))       $inquiry->party       = is_array($out['party'] ?? null) ? $out['party'] : ($inquiry->party ?? null);
+        if ($force || empty($inquiry->units))       $inquiry->units       = is_array($out['units'] ?? null) ? $out['units'] : ($inquiry->units ?? null);
+
+        if ($force || empty($inquiry->wishes))      $inquiry->wishes      = is_array($out['wishes'] ?? null) ? $out['wishes'] : ($inquiry->wishes ?? null);
+        if ($force || empty($inquiry->questions))   $inquiry->questions   = is_array($out['questions'] ?? null) ? $out['questions'] : ($inquiry->questions ?? null);
+        if ($force || empty($inquiry->tags))        $inquiry->tags        = is_array($out['tags'] ?? null) ? $out['tags'] : ($inquiry->tags ?? null);
+        if ($force || empty($inquiry->why_no_offer))$inquiry->why_no_offer= is_array($out['why_no_offer'] ?? null) ? $out['why_no_offer'] : ($inquiry->why_no_offer ?? null);
+
+        // summary
         $set('region', $out['region'] ?? null);
         $set('location', $out['location'] ?? null);
         $set('month_hint', $out['month_hint'] ?? null);
@@ -146,7 +159,7 @@ class AiParseInquiries extends Command
         $set('date_to', $out['date_to'] ?? null);
         $set('nights', $out['nights'] ?? null);
 
-        // Normalize adults/children (AI može vratiti string/array)
+        // Normalize adults/children
         $adults = $out['adults'] ?? null;
         $children = $out['children'] ?? null;
 
@@ -165,7 +178,7 @@ class AiParseInquiries extends Command
         $set('adults', $adults);
         $set('children', $children);
 
-        // children_ages: može doći kao string ili array -> normalize
+        // children_ages normalize
         if (array_key_exists('children_ages', $out)) {
             $ages = \App\Services\InquiryMissingData::normalizeChildrenAges($out['children_ages']);
             if ($force || empty($inquiry->children_ages)) {
@@ -184,5 +197,14 @@ class AiParseInquiries extends Command
 
         $set('special_requirements', $out['special_requirements'] ?? null);
         $set('language', $out['language'] ?? null);
+
+        // ✅ deterministički date_to samo kad je date_from realan (ne window)
+        if ($inquiry->date_from && $inquiry->nights && ! $inquiry->date_to) {
+            try {
+                $inquiry->date_to = Carbon::parse($inquiry->date_from)
+                    ->addDays((int) $inquiry->nights)
+                    ->toDateString();
+            } catch (\Throwable) {}
+        }
     }
 }

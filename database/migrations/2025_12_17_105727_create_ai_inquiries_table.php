@@ -11,9 +11,9 @@ return new class extends Migration
         Schema::create('ai_inquiries', function (Blueprint $table) {
             $table->id();
 
-            $table->string('source', 50)->default('local'); // local|imap|manual
+            $table->string('source', 50)->default('local');
             $table->string('message_id', 255)->nullable()->index();
-            $table->string('message_hash', 255)->unique();   // dedupe ključ
+            $table->string('message_hash', 255)->unique();
 
             $table->string('from_email', 255)->nullable();
             $table->string('subject', 255)->nullable();
@@ -25,6 +25,16 @@ return new class extends Migration
             // Pipeline status (string da ne puca kad dodaš nove statuse)
             $table->string('status', 50)->default('new');
             $table->boolean('ai_stopped')->default(false);
+
+            /**
+             * ŠIRA SLIKA (kanonski meta podaci za pipeline)
+             */
+            $table->string('intent', 50)->nullable()->index();
+            $table->string('out_of_scope_reason')->nullable();
+
+            // Audit: šta je extractor vratio (full payload + warningi)
+            $table->json('parsed_payload')->nullable();
+            $table->json('parse_warnings')->nullable();
 
             // Veza ka poslovnom Inquiry
             $table->foreignId('inquiry_id')->nullable()->index()
@@ -46,6 +56,9 @@ return new class extends Migration
             // praktični indexi za lookup/dedupe/debug
             $table->index(['source', 'message_id']);
             $table->index(['source', 'message_hash']);
+
+            // korisno za listanje po intent-u u pipeline-u
+            $table->index(['intent', 'status']);
         });
     }
 

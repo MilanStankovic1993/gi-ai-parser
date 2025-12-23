@@ -4,18 +4,20 @@ namespace App\Filament\Resources\InquiryResource\Pages;
 
 use App\Filament\Resources\InquiryResource;
 use App\Mail\InquiryDraftMail;
+use App\Models\AiInquiry;
 use App\Models\Inquiry;
 use App\Services\InquiryAccommodationMatcher;
 use App\Services\InquiryAiExtractor;
 use App\Services\InquiryMissingData;
 use App\Services\InquiryOfferDraftBuilder;
+use Carbon\Carbon;
 use Filament\Actions;
 use Filament\Forms\Components\DatePicker;
 use Filament\Forms\Components\Hidden;
+use Filament\Forms\Components\Repeater;
 use Filament\Forms\Components\Select;
 use Filament\Forms\Components\Textarea;
 use Filament\Forms\Components\TextInput;
-use Filament\Forms\Components\Toggle;
 use Filament\Infolists\Components\Grid;
 use Filament\Infolists\Components\Section;
 use Filament\Infolists\Components\Tabs;
@@ -38,8 +40,61 @@ class ViewInquiry extends ViewRecord
         return MaxWidth::Full;
     }
 
+    /**
+     * Najvažnije: uvek učitaj aiInquiry da bi tabovi videli JSON polja.
+     */
+    public function mount(int|string $record): void
+    {
+        parent::mount($record);
+
+        /** @var Inquiry $r */
+        $r = Inquiry::query()
+            ->with('aiInquiry')
+            ->findOrFail($this->record->getKey());
+
+        $this->record = $r;
+    }
+
+    private function refreshRecord(): void
+    {
+        /** @var Inquiry $r */
+        $r = Inquiry::query()
+            ->with('aiInquiry')
+            ->findOrFail($this->record->getKey());
+
+        $this->record = $r;
+
+        $this->dispatch('$refresh');
+    }
+
+    private function groupsCount(Inquiry $r): int
+    {
+        $groups = data_get($r, 'party.groups', []);
+        if (is_string($groups)) {
+            $decoded = json_decode($groups, true);
+            $groups = is_array($decoded) ? $decoded : [];
+        }
+        return is_array($groups) ? count($groups) : 0;
+    }
+
+    private function isSingle(Inquiry $r): bool
+    {
+        return $this->groupsCount($r) <= 1;
+    }
+
+    private function isMulti(Inquiry $r): bool
+    {
+        return $this->groupsCount($r) >= 2;
+    }
+
     protected function getHeaderActions(): array
     {
+        $triStateOptions = [
+            ''  => '-',
+            '1' => 'Da',
+            '0' => 'Ne',
+        ];
+
         return [
             Actions\Action::make('send_reply')
                 ->label('Send')
@@ -48,7 +103,7 @@ class ViewInquiry extends ViewRecord
                 ->visible(fn () =>
                     filled($this->record->guest_email) &&
                     filled($this->record->ai_draft) &&
-                    in_array($this->record->status, ['needs_info', 'extracted', 'suggested'], true)
+                    in_array($this->record->status, ['needs_info', 'extracted', 'suggested', 'no_ai'], true)
                 )
                 ->fillForm(function () {
                     /** @var Inquiry $record */
@@ -111,7 +166,6 @@ class ViewInquiry extends ViewRecord
                             ->body('Popuni SMTP_* u .env za ovaj inbox (username/password/from).')
                             ->danger()
                             ->send();
-
                         return;
                     }
 
@@ -133,7 +187,6 @@ class ViewInquiry extends ViewRecord
                             ->body($e->getMessage())
                             ->danger()
                             ->send();
-
                         return;
                     }
 
@@ -141,16 +194,23 @@ class ViewInquiry extends ViewRecord
                     $record->processed_at = now();
                     $record->save();
 
+                    $this->refreshRecord();
+
                     Notification::make()
                         ->title('Mejl je poslat')
                         ->success()
                         ->send();
                 }),
 
+            /**
+             * ✅ QUICK EDIT samo za SINGLE (party.groups <= 1)
+             * (Ne vezujemo se za units da ne bude konflikta.)
+             */
             Actions\Action::make('quick_edit')
                 ->label('Quick edit')
                 ->icon('heroicon-o-pencil-square')
                 ->color('warning')
+                ->visible(fn () => $this->isSingle($this->record))
                 ->fillForm(fn () => $this->prefillQuickEditForm($this->record))
                 ->form([
                     TextInput::make('region')->label('Regija')->maxLength(255),
@@ -172,11 +232,11 @@ class ViewInquiry extends ViewRecord
                     TextInput::make('budget_min')->label('Budžet min (€)')->numeric()->minValue(0),
                     TextInput::make('budget_max')->label('Budžet max (€)')->numeric()->minValue(0),
 
-                    Toggle::make('wants_near_beach')->label('Blizu plaže'),
-                    Toggle::make('wants_parking')->label('Parking'),
-                    Toggle::make('wants_quiet')->label('Mirna lokacija'),
-                    Toggle::make('wants_pets')->label('Ljubimci'),
-                    Toggle::make('wants_pool')->label('Bazen'),
+                    Select::make('wants_near_beach')->label('Blizu plaže')->options($triStateOptions)->native(false),
+                    Select::make('wants_parking')->label('Parking')->options($triStateOptions)->native(false),
+                    Select::make('wants_quiet')->label('Mirna lokacija')->options($triStateOptions)->native(false),
+                    Select::make('wants_pets')->label('Ljubimci')->options($triStateOptions)->native(false),
+                    Select::make('wants_pool')->label('Bazen')->options($triStateOptions)->native(false),
 
                     Textarea::make('special_requirements')->label('Napomena / dodatni zahtevi')->rows(3),
 
@@ -207,6 +267,14 @@ class ViewInquiry extends ViewRecord
 
                     $data['children_ages'] = InquiryMissingData::normalizeChildrenAges($data['children_ages'] ?? null);
 
+                    foreach (['wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool'] as $k) {
+                        if (! array_key_exists($k, $data)) continue;
+                        $v = $data[$k];
+                        if ($v === '' || $v === null) $data[$k] = null;
+                        elseif ((string) $v === '1') $data[$k] = true;
+                        elseif ((string) $v === '0') $data[$k] = false;
+                    }
+
                     $children = isset($data['children']) ? (int) $data['children'] : null;
                     if ($children !== null && $children > 0 && empty($data['children_ages'])) {
                         Notification::make()
@@ -214,7 +282,6 @@ class ViewInquiry extends ViewRecord
                             ->body('Po zahtevu: ako ima dece, uzrast je potreban da bismo dali ponudu.')
                             ->warning()
                             ->send();
-
                         return;
                     }
 
@@ -228,12 +295,117 @@ class ViewInquiry extends ViewRecord
                         'reply_mode','status',
                     ]));
 
+                    // ✅ sync canonical party.groups (single)
+                    $party = is_array($record->party) ? $record->party : [];
+                    $party['groups'] = [[
+                        'adults'        => (int) ($record->adults ?? 0),
+                        'children'      => (int) ($record->children ?? 0),
+                        'children_ages' => is_array($record->children_ages) ? array_values($record->children_ages) : (InquiryMissingData::normalizeChildrenAges($record->children_ages) ?? []),
+                        'requirements'  => [],
+                    ]];
+                    $record->party = $party;
+
                     $record->processed_at = now();
                     $record->save();
 
-                    $this->record = Inquiry::query()
-                        ->with('aiInquiry')
-                        ->findOrFail($record->getKey());
+                    $this->refreshRecord();
+
+                    $missing = InquiryMissingData::detect($this->record);
+
+                    Notification::make()
+                        ->title('Sačuvano')
+                        ->body(empty($missing)
+                            ? 'Sada ima dovoljno podataka za generisanje ponude.'
+                            : 'I dalje nedostaje: ' . implode('; ', $missing)
+                        )
+                        ->success()
+                        ->send();
+                }),
+
+            /**
+             * ✅ EDIT GROUPS samo kad ima 2+ party.groups
+             */
+            Actions\Action::make('edit_groups')
+                ->label('Edit groups')
+                ->icon('heroicon-o-user-group')
+                ->color('warning')
+                ->visible(fn () => $this->isMulti($this->record))
+                ->fillForm(function () {
+                    $groups = data_get($this->record, 'party.groups', []);
+                    if (is_string($groups)) {
+                        $decoded = json_decode($groups, true);
+                        $groups = is_array($decoded) ? $decoded : [];
+                    }
+                    $groups = is_array($groups) ? $groups : [];
+
+                    $groups = collect($groups)->map(function ($g) {
+                        $g = is_array($g) ? $g : [];
+
+                        $ages = data_get($g, 'children_ages', []);
+                        if (is_array($ages)) $g['children_ages'] = implode(', ', $ages);
+
+                        $req = data_get($g, 'requirements', []);
+                        if (is_array($req)) $g['requirements'] = implode("\n", $req);
+
+                        return $g;
+                    })->values()->all();
+
+                    return ['groups' => $groups];
+                })
+                ->form([
+                    Repeater::make('groups')
+                        ->label('Porodice')
+                        ->schema([
+                            TextInput::make('adults')->numeric()->minValue(0)->required(),
+                            TextInput::make('children')->numeric()->minValue(0)->default(0),
+
+                            TextInput::make('children_ages')
+                                ->label('Uzrast dece (npr: 8, 5)')
+                                ->helperText('Ako children > 0, obavezno upisati sve uzraste.'),
+
+                            Textarea::make('requirements')
+                                ->label('Zahtevi (po liniji)')
+                                ->rows(3)
+                                ->helperText('Npr: odvojena soba, mirno, parking...'),
+                        ])
+                        ->columns(2)
+                        ->minItems(2)
+                        ->reorderable(false),
+                ])
+                ->action(function (array $data) {
+                    /** @var Inquiry $record */
+                    $record = $this->record;
+
+                    $groups = $data['groups'] ?? [];
+                    $groups = is_array($groups) ? $groups : [];
+
+                    $groups = collect($groups)->map(function ($g) {
+                        $g = is_array($g) ? $g : [];
+
+                        $g['adults'] = (int) ($g['adults'] ?? 0);
+                        $g['children'] = (int) ($g['children'] ?? 0);
+
+                        $g['children_ages'] = InquiryMissingData::normalizeChildrenAges($g['children_ages'] ?? null) ?? [];
+
+                        $lines = preg_split("/\r\n|\n|\r/", (string) ($g['requirements'] ?? '')) ?: [];
+                        $g['requirements'] = array_values(array_filter(array_map('trim', $lines)));
+
+                        return $g;
+                    })->values()->all();
+
+                    $party = is_array($record->party) ? $record->party : [];
+                    $party['groups'] = $groups;
+                    $record->party = $party;
+
+                    // legacy totals (da UI i search/filteri ostanu ok)
+                    $record->adults = collect($groups)->sum('adults');
+                    $record->children = collect($groups)->sum('children');
+                    $record->children_ages = collect($groups)->pluck('children_ages')->flatten()->values()->all();
+
+                    $record->processed_at = now();
+                    $record->save();
+
+                    $this->refreshRecord();
 
                     $missing = InquiryMissingData::detect($this->record);
 
@@ -258,102 +430,194 @@ class ViewInquiry extends ViewRecord
                         ->with('aiInquiry')
                         ->findOrFail($this->record->getKey());
 
-                    // ✅ sinhronizuj Livewire/Filament record
                     $this->record = $record;
 
                     $extractor = app(InquiryAiExtractor::class);
                     $data = $extractor->extract($record);
 
-                    // --- fill basic extracted fields (ne briši postojeće ako AI vrati null) ---
+                    $propertyCandidates = is_array($data['property_candidates'] ?? null) ? $data['property_candidates'] : [];
+                    $locationCandidates = is_array($data['location_candidates'] ?? null) ? $data['location_candidates'] : [];
+                    $regionCandidates   = is_array($data['region_candidates'] ?? null) ? $data['region_candidates'] : [];
+                    $dateCandidates     = is_array($data['date_candidates'] ?? null) ? $data['date_candidates'] : [];
+
+                    $entities   = is_array($data['entities'] ?? null) ? $data['entities'] : null;
+                    $travelTime = is_array($data['travel_time'] ?? null) ? $data['travel_time'] : null;
+
+                    $party     = is_array($data['party'] ?? null) ? $data['party'] : [];
+                    $units     = is_array($data['units'] ?? null) ? $data['units'] : [];
+                    $wishes    = is_array($data['wishes'] ?? null) ? $data['wishes'] : [];
+                    $questions = is_array($data['questions'] ?? null) ? $data['questions'] : [];
+                    $tags      = is_array($data['tags'] ?? null) ? $data['tags'] : [];
+                    $why       = is_array($data['why_no_offer'] ?? null) ? $data['why_no_offer'] : [];
+
+                    // 1) canonical json fields
+                    $record->intent = $data['intent'] ?? $record->intent;
+
+                    $record->entities = $entities ?: [
+                        'property_candidates' => $propertyCandidates,
+                        'location_candidates' => $locationCandidates,
+                        'region_candidates'   => $regionCandidates,
+                        'date_candidates'     => $dateCandidates,
+                    ];
+
+                    $record->travel_time = $travelTime ?: [
+                        'date_candidates' => $dateCandidates,
+                        'month_hint'      => $data['month_hint'] ?? ($record->month_hint ?? null),
+                        'date_from'       => $data['date_from'] ?? ($record->date_from ? $record->date_from->toDateString() : null),
+                        'date_to'         => $data['date_to']   ?? ($record->date_to ? $record->date_to->toDateString() : null),
+                        'nights'          => $data['nights'] ?? $record->nights,
+                    ];
+
+                    $record->party        = $party;
+                    $record->units        = $units; // debug only
+                    $record->wishes       = $wishes;
+                    $record->questions    = $questions;
+                    $record->tags         = $tags;
+                    $record->why_no_offer = $why;
+
+                    // 2) summary fields – ne gazi praznim
                     foreach (['region','location','month_hint'] as $k) {
                         if (array_key_exists($k, $data) && filled($data[$k])) {
                             $record->{$k} = $data[$k];
                         }
                     }
 
-                    if (!empty($data['date_from'])) {
-                        $record->date_from = $data['date_from'];
-                    }
-                    if (!empty($data['date_to'])) {
-                        $record->date_to = $data['date_to'];
-                    }
-                    if (array_key_exists('nights', $data) && $data['nights'] !== null) {
-                        $record->nights = (int) $data['nights'];
-                    }
+                    if (! empty($data['date_from'])) $record->date_from = $data['date_from'];
+                    if (! empty($data['date_to']))   $record->date_to   = $data['date_to'];
 
-                    // --- adults / children ---
-                    $adults   = $data['adults']   ?? null;
-                    $children = $data['children'] ?? null;
+                    if (array_key_exists('nights', $data) && $data['nights'] !== null) $record->nights = (int) $data['nights'];
+                    if (array_key_exists('adults', $data) && $data['adults'] !== null) $record->adults = (int) $data['adults'];
+                    if (array_key_exists('children', $data) && $data['children'] !== null) $record->children = (int) $data['children'];
 
-                    if (is_array($adults))   $adults = count($adults);
-                    if (is_array($children)) $children = count($children);
-
-                    if (is_string($adults))   $adults = (int) preg_replace('/\D+/', '', $adults) ?: null;
-                    if (is_string($children)) $children = (int) preg_replace('/\D+/', '', $children) ?: null;
-
-                    if (is_int($adults))   $record->adults = $adults;
-                    if (is_int($children)) $record->children = $children;
-
-                    // --- children ages (uvek normalizuj ako je ključ prisutan) ---
                     if (array_key_exists('children_ages', $data)) {
                         $record->children_ages = InquiryMissingData::normalizeChildrenAges($data['children_ages']);
                     }
 
-                    // --- budget ---
                     foreach (['budget_min','budget_max'] as $k) {
-                        if (array_key_exists($k, $data) && $data[$k] !== null) {
-                            $record->{$k} = $data[$k];
-                        }
+                        if (array_key_exists($k, $data) && $data[$k] !== null) $record->{$k} = (int) $data[$k];
                     }
 
-                    // --- wants ---
                     foreach (['wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool'] as $k) {
-                        if (array_key_exists($k, $data) && $data[$k] !== null) {
-                            $record->{$k} = (bool) $data[$k];
-                        }
+                        if (array_key_exists($k, $data) && $data[$k] !== null) $record->{$k} = (bool) $data[$k];
                     }
 
                     if (array_key_exists('special_requirements', $data) && filled($data['special_requirements'])) {
                         $record->special_requirements = $data['special_requirements'];
                     }
 
-                    $record->language = $data['language'] ?? $record->language ?? 'sr';
-                    $record->extraction_mode  = $data['_mode'] ?? $record->extraction_mode ?? 'fallback';
+                    $record->language         = $data['language'] ?? ($record->language ?? 'sr');
+                    $record->extraction_mode  = $data['_mode'] ?? ($record->extraction_mode ?? 'fallback');
                     $record->extraction_debug = $data;
 
-                    // ✅ KLJUČNO: deterministički izračun date_to ako imamo date_from + nights
+                    // 3) deterministički date_to
                     if ($record->date_from && $record->nights && ! $record->date_to) {
                         try {
                             $record->date_to = Carbon::parse($record->date_from)
                                 ->addDays((int) $record->nights)
                                 ->toDateString();
-                        } catch (\Throwable) {
-                            // ignore
-                        }
+                        } catch (\Throwable) {}
                     }
 
-                    // ✅ Statusi: izračunaj missing i sync-uj i Inquiry i AiInquiry
+                    /**
+                     * ✅ 4) CANONICALIZE party.groups (najbitnije)
+                     */
+                    $party = is_array($record->party) ? $record->party : [];
+                    $groups = data_get($party, 'groups', []);
+
+                    // groups JSON string?
+                    if (is_string($groups)) {
+                        $decoded = json_decode($groups, true);
+                        $groups = is_array($decoded) ? $decoded : [];
+                    }
+
+                    // ako nema groups, a ima units => napravi groups iz units[*].party_group
+                    $units = is_array($record->units) ? $record->units : [];
+                    if ((! is_array($groups) || count($groups) === 0) && count($units) > 0) {
+                        $groups = collect($units)->map(function ($u) {
+                            $g = data_get($u, 'party_group', []);
+                            $g = is_array($g) ? $g : [];
+
+                            $g['adults'] = (int) data_get($g, 'adults', 0);
+                            $g['children'] = (int) data_get($g, 'children', 0);
+                            $g['children_ages'] = InquiryMissingData::normalizeChildrenAges(data_get($g, 'children_ages')) ?? [];
+                            $req = data_get($g, 'requirements', []);
+                            $g['requirements'] = is_array($req) ? array_values(array_filter(array_map('trim', $req))) : [];
+
+                            return $g;
+                        })->values()->all();
+                    }
+
+                    // ako i dalje nema groups => napravi single group iz legacy
+                    if (! is_array($groups) || count($groups) === 0) {
+                        $groups = [[
+                            'adults'        => (int) ($record->adults ?? 0),
+                            'children'      => (int) ($record->children ?? 0),
+                            'children_ages' => InquiryMissingData::normalizeChildrenAges($record->children_ages) ?? [],
+                            'requirements'  => [],
+                        ]];
+                    }
+
+                    // normalize groups
+                    $groups = collect($groups)->map(function ($g) {
+                        $g = is_array($g) ? $g : [];
+                        $g['adults'] = (int) ($g['adults'] ?? 0);
+                        $g['children'] = (int) ($g['children'] ?? 0);
+                        $g['children_ages'] = InquiryMissingData::normalizeChildrenAges($g['children_ages'] ?? null) ?? [];
+                        $req = $g['requirements'] ?? [];
+                        $g['requirements'] = is_array($req) ? array_values(array_filter(array_map('trim', $req))) : [];
+                        return $g;
+                    })->values()->all();
+
+                    $party['groups'] = $groups;
+                    $record->party = $party;
+
+                    // legacy totals iz group-a
+                    $record->adults = collect($groups)->sum('adults');
+                    $record->children = collect($groups)->sum('children');
+                    $record->children_ages = collect($groups)->pluck('children_ages')->flatten()->values()->all();
+
+                    // 5) status
+                    $intent = (string) ($record->intent ?? 'unknown');
+                    $isOutOfScope = in_array($intent, ['owner_request','long_stay_private','spam'], true);
+
                     $missing = InquiryMissingData::detect($record);
 
-                    $record->status = empty($missing) ? 'extracted' : Inquiry::STATUS_NEEDS_INFO;
+                    if ($isOutOfScope) {
+                        $record->status = Inquiry::STATUS_NO_AI;
+                        $record->ai_draft = $record->ai_draft ?: "Poštovani,\n\nHvala na poruci. Ovaj tip upita nije u dometu standardne ponude (out-of-scope: {$intent}).\n\nSrdačan pozdrav,\nGrckaInfo tim";
+                    } else {
+                        $record->status = empty($missing) ? Inquiry::STATUS_EXTRACTED : Inquiry::STATUS_NEEDS_INFO;
+                    }
+
                     $record->processed_at = now();
                     $record->save();
 
-                    // sync ai_inquiries
+                    // 6) sync ai_inquiries audit
                     $record->loadMissing('aiInquiry');
                     if ($record->aiInquiry) {
-                        $record->aiInquiry->missing_fields = empty($missing) ? null : $missing;
-                        $record->aiInquiry->status = empty($missing) ? 'parsed' : 'needs_info';
-                        $record->aiInquiry->parsed_at = now();
-                        $record->aiInquiry->save();
+                        /** @var AiInquiry $ai */
+                        $ai = $record->aiInquiry;
+
+                        $ai->intent = $record->intent;
+                        $ai->out_of_scope_reason = $data['out_of_scope_reason'] ?? null;
+
+                        $ai->parsed_payload = Arr::except($data, ['_mode', '_warnings']);
+                        $ai->parse_warnings = $data['_warnings'] ?? [];
+
+                        $ai->missing_fields = empty($missing) ? null : $missing;
+                        $ai->status = $isOutOfScope
+                            ? AiInquiry::STATUS_NO_AI
+                            : (empty($missing) ? AiInquiry::STATUS_PARSED : AiInquiry::STATUS_NEEDS_INFO);
+
+                        $ai->parsed_at = now();
+                        $ai->save();
                     }
+
+                    $this->refreshRecord();
 
                     Notification::make()
                         ->title('Extraction je uspešno izvršena')
-                        ->body($record->extraction_mode === 'ai'
-                            ? 'Korišćen je AI extractor.'
-                            : 'Korišćen je lokalni parser (fallback).'
-                        )
+                        ->body(($record->extraction_mode ?? '') === 'ai' ? 'Korišćen je AI extractor.' : 'Korišćen je lokalni parser (fallback).')
                         ->success()
                         ->send();
                 }),
@@ -363,186 +627,7 @@ class ViewInquiry extends ViewRecord
                 ->icon('heroicon-o-envelope')
                 ->color('success')
                 ->requiresConfirmation()
-                ->action(function () {
-                    /** @var Inquiry $record */
-                    $record = Inquiry::query()
-                        ->with('aiInquiry')
-                        ->findOrFail($this->record->getKey());
-
-                    // ✅ sinhronizuj Livewire/Filament record
-                    $this->record = $record;
-
-                    $missing = InquiryMissingData::detect($record);
-
-                    // 1) Ako fale ključni podaci -> template za dopunu (bez ponude)
-                    if (! empty($missing)) {
-                        $record->ai_draft = view('ai.templates.missing-info', [
-                            'missing' => $missing,
-                        ])->render();
-
-                        $record->status = Inquiry::STATUS_NEEDS_INFO;
-                        $record->processed_at = now();
-                        $record->save();
-
-                        Notification::make()
-                            ->title('Nedostaju ključni podaci')
-                            ->body('Kreiran je draft sa pitanjima za dopunu (bez ponude).')
-                            ->warning()
-                            ->send();
-
-                        return;
-                    }
-
-                    $matcher = app(InquiryAccommodationMatcher::class);
-
-                    // 2) primary+alternatives+log
-                    $out = $matcher->matchWithAlternatives($record, 5, 5);
-
-                    $primary = collect($out['primary'] ?? []);
-                    $alts    = collect($out['alternatives'] ?? []);
-                    $log     = $out['log'] ?? [];
-
-                    // snimi payload na ai_inquiries
-                    $record->loadMissing('aiInquiry');
-                    if ($record->aiInquiry) {
-                        $record->aiInquiry->suggestions_payload = [
-                            'primary'      => $primary->take(5)->values()->all(),
-                            'alternatives' => $alts->take(5)->values()->all(),
-                            'log'          => $log,
-                        ];
-                        $record->aiInquiry->save();
-                    }
-
-                    // helper: candidates -> template items (title/details/price/url)
-                    $toTemplateItems = function ($candidates) use ($record) {
-                        return collect($candidates)->take(5)->map(function ($c) use ($record) {
-                            $hotel = data_get($c, 'hotel');
-                            $room  = data_get($c, 'room');
-
-                            $title =
-                                data_get($c, 'name')
-                                ?? data_get($c, 'title')
-                                ?? data_get($hotel, 'hotel_title')
-                                ?? data_get($hotel, 'title')
-                                ?? 'Smeštaj';
-
-                            // direktan link ka stranici na sajtu
-                            $url = data_get($c, 'url')
-                                ?? data_get($hotel, 'url')
-                                ?? null;
-
-                            if ($url && ! str_starts_with($url, 'http')) {
-                                $url = 'https://' . ltrim($url, '/');
-                            }
-
-                            // cena za period (ako je imamo)
-                            $total = data_get($c, 'price.total');
-                            $price = $total
-                                ? number_format((float) $total, 0, ',', '.') . ' €'
-                                : null;
-
-                            $details = collect([
-                                // tip (ako postoji u bazi; prilagodi polja po potrebi)
-                                data_get($room, 'room_type') ? 'Tip: ' . data_get($room, 'room_type') : null,
-
-                                // kapacitet
-                                (data_get($room, 'room_adults') || data_get($room, 'room_children'))
-                                    ? 'Kapacitet: do ' . ((int) data_get($room, 'room_adults', 0) + (int) data_get($room, 'room_children', 0)) . ' osobe'
-                                    : null,
-
-                                // plaža (ako imaš neko polje u hotelu – prilagodi)
-                                data_get($hotel, 'beach_distance') ? 'Plaža: ' . data_get($hotel, 'beach_distance') : null,
-                            ])->filter()->implode(' • ');
-
-                            return [
-                                'title'   => $title,
-                                'details' => $details ?: null,
-                                'price'   => $price,
-                                'url'     => $url,
-                            ];
-                        })->values()->all();
-                    };
-
-                    // 3) Ako NEMA primary, ali IMA alternatives -> šaljemo alternatives (traženi fallback)
-                    if ($primary->isEmpty() && $alts->isNotEmpty()) {
-
-                        $record->ai_draft = view('ai.templates.no-primary-with-alternatives', [
-                            'guest'        => trim((string) ($record->guest_name ?? '')),
-                            'alternatives' => $toTemplateItems($alts),
-                        ])->render();
-
-                        $record->status = 'suggested';
-                        $record->processed_at = now();
-                        $record->save();
-
-                        Notification::make()
-                            ->title('Nema ponude po traženim kriterijumima')
-                            ->body('Generisan je odgovor sa alternativnim predlozima smeštaja.')
-                            ->warning()
-                            ->send();
-
-                        return;
-                    }
-
-                    // 4) Ako NEMA ni primary ni alternatives -> probaj fallback kroz matcher (isti matcher, ne random lista)
-                    if ($primary->isEmpty() && $alts->isEmpty()) {
-
-                        $fallbackCandidates = $matcher->findFallbackAlternatives($record, 5);
-
-                        if ($fallbackCandidates->isNotEmpty()) {
-                            $record->ai_draft = view('ai.templates.no-primary-with-alternatives', [
-                                'guest'        => trim((string) ($record->guest_name ?? '')),
-                                'alternatives' => $toTemplateItems($fallbackCandidates),
-                            ])->render();
-
-                            $record->status = 'suggested';
-                            $record->processed_at = now();
-                            $record->save();
-
-                            Notification::make()
-                                ->title('Nema ponude po kriterijumima')
-                                ->body('Generisan je odgovor sa 4–5 alternativnih predloga.')
-                                ->warning()
-                                ->send();
-
-                            return;
-                        }
-
-                        // baš ništa nije nađeno → informativni draft
-                        $record->ai_draft = view('ai.templates.missing-info', [
-                            'missing' => [
-                                'Nažalost trenutno nemamo odgovarajuću ponudu u bazi po traženim kriterijumima. Da li ste fleksibilni za drugu lokaciju / datum (±2–3 dana) ili budžet, kako bismo poslali 4–5 alternativnih predloga?',
-                            ],
-                        ])->render();
-
-                        $record->status = 'extracted';
-                        $record->processed_at = now();
-                        $record->save();
-
-                        Notification::make()
-                            ->title('Nema kandidata')
-                            ->body('Kreiran je informativni draft.')
-                            ->warning()
-                            ->send();
-
-                        return;
-                    }
-
-                    // 5) Ima primary -> standardni draft sa ponudama
-                    $builder = app(InquiryOfferDraftBuilder::class);
-                    $draft   = $builder->build($record, $primary);
-
-                    $record->ai_draft = $draft;
-                    $record->status   = 'suggested';
-                    $record->processed_at = now();
-                    $record->save();
-
-                    Notification::make()
-                        ->title('Draft je generisan')
-                        ->body('Spreman za pregled i eventualne izmene.')
-                        ->success()
-                        ->send();
-                }),
+                ->action(fn () => $this->generateAiDraft()),
 
             Actions\Action::make('mark_as_replied')
                 ->label('Mark as replied')
@@ -558,6 +643,8 @@ class ViewInquiry extends ViewRecord
                     $record->processed_at = now();
                     $record->save();
 
+                    $this->refreshRecord();
+
                     Notification::make()
                         ->title('Upit je označen kao završen')
                         ->body('Status je postavljen na "Replied".')
@@ -567,6 +654,181 @@ class ViewInquiry extends ViewRecord
 
             Actions\EditAction::make(),
         ];
+    }
+
+    private function generateAiDraft(): void
+    {
+        /** @var Inquiry $record */
+        $record = Inquiry::query()
+            ->with('aiInquiry')
+            ->findOrFail($this->record->getKey());
+
+        $this->record = $record;
+
+        $intent = (string) ($record->intent ?? 'unknown');
+        if (in_array($intent, ['owner_request','long_stay_private','spam'], true)) {
+            $record->ai_draft = $record->ai_draft ?: "Poštovani,\n\nHvala na poruci. Ovaj tip upita trenutno ne obrađujemo automatski (intent: {$intent}).\n\nSrdačan pozdrav,\nGrckaInfo tim";
+            $record->status = Inquiry::STATUS_NO_AI;
+            $record->processed_at = now();
+            $record->save();
+
+            $this->refreshRecord();
+
+            Notification::make()
+                ->title('Out-of-scope')
+                ->body('Generisan je informativni draft (bez ponude).')
+                ->warning()
+                ->send();
+            return;
+        }
+
+        $missing = InquiryMissingData::detect($record);
+
+        if (! empty($missing)) {
+            $record->ai_draft = view('ai.templates.missing-info', [
+                'missing' => $missing,
+            ])->render();
+
+            $record->status = Inquiry::STATUS_NEEDS_INFO;
+            $record->processed_at = now();
+            $record->save();
+
+            $this->refreshRecord();
+
+            Notification::make()
+                ->title('Nedostaju ključni podaci')
+                ->body('Kreiran je draft sa pitanjima za dopunu (bez ponude).')
+                ->warning()
+                ->send();
+            return;
+        }
+
+        $matcher = app(InquiryAccommodationMatcher::class);
+        $out = $matcher->matchWithAlternatives($record, 5, 5);
+
+        $primary = collect($out['primary'] ?? []);
+        $alts    = collect($out['alternatives'] ?? []);
+        $log     = $out['log'] ?? [];
+
+        $record->loadMissing('aiInquiry');
+        if ($record->aiInquiry) {
+            $record->aiInquiry->suggestions_payload = [
+                'primary'      => $primary->take(5)->values()->all(),
+                'alternatives' => $alts->take(5)->values()->all(),
+                'log'          => $log,
+            ];
+            $record->aiInquiry->suggested_at = now();
+            $record->aiInquiry->save();
+        }
+
+        $toTemplateItems = function ($candidates) {
+            return collect($candidates)->take(5)->map(function ($c) {
+                $hotel = data_get($c, 'hotel');
+                $title =
+                    data_get($c, 'title')
+                    ?? data_get($hotel, 'hotel_title')
+                    ?? data_get($hotel, 'title')
+                    ?? 'Smeštaj';
+
+                $url = data_get($hotel, 'public_url')
+                    ?? data_get($hotel, 'link')
+                    ?? data_get($c, 'url')
+                    ?? null;
+
+                $total = data_get($c, 'price.total');
+                $price = $total ? number_format((float) $total, 0, ',', '.') . ' €' : null;
+
+                return [
+                    'title'   => $title,
+                    'details' => null,
+                    'price'   => $price,
+                    'url'     => $url,
+                ];
+            })->values()->all();
+        };
+
+        if ($primary->isEmpty() && $alts->isNotEmpty()) {
+            $record->ai_draft = view('ai.templates.no-primary-with-alternatives', [
+                'guest'        => trim((string) ($record->guest_name ?? '')),
+                'alternatives' => $toTemplateItems($alts),
+            ])->render();
+
+            $record->status = Inquiry::STATUS_SUGGESTED;
+            $record->processed_at = now();
+            $record->save();
+
+            $this->refreshRecord();
+
+            Notification::make()
+                ->title('Nema ponude po traženim kriterijumima')
+                ->body('Generisan je odgovor sa alternativnim predlozima smeštaja.')
+                ->warning()
+                ->send();
+            return;
+        }
+
+        if ($primary->isEmpty() && $alts->isEmpty()) {
+            $fallbackCandidates = collect();
+
+            if (method_exists($matcher, 'findFallbackAlternatives')) {
+                $fallbackCandidates = $matcher->findFallbackAlternatives($record, 5);
+            }
+
+            if ($fallbackCandidates->isNotEmpty()) {
+                $record->ai_draft = view('ai.templates.no-primary-with-alternatives', [
+                    'guest'        => trim((string) ($record->guest_name ?? '')),
+                    'alternatives' => $toTemplateItems($fallbackCandidates),
+                ])->render();
+
+                $record->status = Inquiry::STATUS_SUGGESTED;
+                $record->processed_at = now();
+                $record->save();
+
+                $this->refreshRecord();
+
+                Notification::make()
+                    ->title('Nema ponude po kriterijumima')
+                    ->body('Generisan je odgovor sa alternativnim predlozima.')
+                    ->warning()
+                    ->send();
+                return;
+            }
+
+            $record->ai_draft = view('ai.templates.missing-info', [
+                'missing' => [
+                    'Trenutno nemamo odgovarajuću ponudu u bazi po traženim kriterijumima. Da li ste fleksibilni za drugu lokaciju / datum (±2–3 dana) ili budžet?',
+                ],
+            ])->render();
+
+            $record->status = Inquiry::STATUS_EXTRACTED;
+            $record->processed_at = now();
+            $record->save();
+
+            $this->refreshRecord();
+
+            Notification::make()
+                ->title('Nema kandidata')
+                ->body('Kreiran je informativni draft.')
+                ->warning()
+                ->send();
+            return;
+        }
+
+        $builder = app(InquiryOfferDraftBuilder::class);
+        $draft   = $builder->build($record, $primary);
+
+        $record->ai_draft = $draft;
+        $record->status   = Inquiry::STATUS_SUGGESTED;
+        $record->processed_at = now();
+        $record->save();
+
+        $this->refreshRecord();
+
+        Notification::make()
+            ->title('Draft je generisan')
+            ->body('Spreman za pregled i eventualne izmene.')
+            ->success()
+            ->send();
     }
 
     public function infolist(Infolist $infolist): Infolist
@@ -590,14 +852,7 @@ class ViewInquiry extends ViewRecord
                                                     TextEntry::make('guest_name')->label('Ime gosta')->default('-'),
                                                     TextEntry::make('guest_email')->label('Email')->default('-'),
                                                     TextEntry::make('guest_phone')->label('Telefon')->default('-'),
-                                                    TextEntry::make('source')
-                                                        ->label('Izvor')
-                                                        ->formatStateUsing(fn ($state) => match ($state) {
-                                                            'email'     => 'Email',
-                                                            'web_form'  => 'Web forma',
-                                                            'manual'    => 'Ručni unos',
-                                                            default     => $state ?? '-',
-                                                        }),
+                                                    TextEntry::make('source')->label('Izvor')->default('-'),
                                                 ]),
                                             TextEntry::make('subject')->label('Naslov / subject')->columnSpanFull()->default('-'),
                                             TextEntry::make('raw_message')->label('Tekst upita')->columnSpanFull()->default('-'),
@@ -608,11 +863,32 @@ class ViewInquiry extends ViewRecord
                                     Grid::make()
                                         ->columns(1)
                                         ->schema([
-                                            Section::make('Ekstrahovani podaci')
+                                            Section::make('Ekstrahovani podaci (summary)')
                                                 ->schema([
+                                                    // ✅ prikaz za MULTI: samo groups_summary (izvor istine)
+                                                    TextEntry::make('groups_summary')
+                                                        ->label('Porodice / grupe')
+                                                        ->state(fn (Inquiry $record) => $this->formatGroupsSummary($record))
+                                                        ->extraAttributes(['style' => 'white-space: pre-wrap;'])
+                                                        ->columnSpanFull()
+                                                        ->visible(fn (Inquiry $record) => $this->isMulti($record)),
+
+                                                    // (opciono) units_summary samo kao read-only debug, i samo kad nema multi-groups
+                                                    TextEntry::make('units_summary')
+                                                        ->label('Pod-upiti (units) – debug')
+                                                        ->state(fn (Inquiry $record) => $this->formatUnitsSummary($record))
+                                                        ->extraAttributes(['style' => 'white-space: pre-wrap; opacity: .85;'])
+                                                        ->columnSpanFull()
+                                                        ->visible(function (Inquiry $record) {
+                                                            $units = data_get($record, 'units', []);
+                                                            return (! $this->isMulti($record))
+                                                                && (is_array($units) && count($units) >= 2);
+                                                        }),
+
                                                     Grid::make()
                                                         ->columns(2)
                                                         ->schema([
+                                                            TextEntry::make('intent')->label('Intent')->default('-'),
                                                             TextEntry::make('region')->label('Regija')->default('-'),
                                                             TextEntry::make('location')->label('Mesto')->default('-'),
                                                             TextEntry::make('month_hint')->label('Okvirni period')->default('-'),
@@ -621,15 +897,17 @@ class ViewInquiry extends ViewRecord
                                                             TextEntry::make('date_from')->label('Datum od')->date(),
                                                             TextEntry::make('date_to')->label('Datum do')->date(),
 
-                                                            TextEntry::make('adults')->label('Odrasli')->default('-'),
-                                                            TextEntry::make('children')->label('Deca')->default('-'),
+                                                            // ✅ totals samo za SINGLE (da nema konfuzije)
+                                                            TextEntry::make('adults')->label('Odrasli')->default('-')
+                                                                ->visible(fn (Inquiry $record) => $this->isSingle($record)),
+                                                            TextEntry::make('children')->label('Deca')->default('-')
+                                                                ->visible(fn (Inquiry $record) => $this->isSingle($record)),
 
                                                             TextEntry::make('children_ages')
                                                                 ->label('Uzrast dece')
+                                                                ->visible(fn (Inquiry $record) => $this->isSingle($record))
                                                                 ->formatStateUsing(function ($state) {
-                                                                    if (is_array($state)) {
-                                                                        return count($state) ? implode(', ', $state) : '-';
-                                                                    }
+                                                                    if (is_array($state)) return count($state) ? implode(', ', $state) : '-';
                                                                     return is_string($state) && trim($state) !== '' ? $state : '-';
                                                                 }),
 
@@ -680,6 +958,7 @@ class ViewInquiry extends ViewRecord
                                                                         'closed'     => 'danger',
                                                                         default      => 'gray',
                                                                     }),
+
                                                                 TextEntry::make('reply_mode')
                                                                     ->label('Odgovor')
                                                                     ->badge()
@@ -691,6 +970,38 @@ class ViewInquiry extends ViewRecord
                                                                 TextEntry::make('processed_at')->label('Obrađeno')->dateTime('d.m.Y H:i'),
                                                             ]),
                                                         ]),
+                                                ]),
+
+                                            Section::make('Sirovi JSON (inquiries)')
+                                                ->collapsible()
+                                                ->collapsed()
+                                                ->schema([
+                                                    TextEntry::make('json_entities')->label('entities')->state(fn (Inquiry $record) => $this->prettyJson($record->entities))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('json_travel_time')->label('travel_time')->state(fn (Inquiry $record) => $this->prettyJson($record->travel_time))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('json_party')->label('party')->state(fn (Inquiry $record) => $this->prettyJson($record->party))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('json_units')->label('units')->state(fn (Inquiry $record) => $this->prettyJson($record->units))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('json_wishes')->label('wishes')->state(fn (Inquiry $record) => $this->prettyJson($record->wishes))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('json_questions')->label('questions')->state(fn (Inquiry $record) => $this->prettyJson($record->questions))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('json_tags')->label('tags')->state(fn (Inquiry $record) => $this->prettyJson($record->tags))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('json_why_no_offer')->label('why_no_offer')->state(fn (Inquiry $record) => $this->prettyJson($record->why_no_offer))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('json_extraction_debug')->label('extraction_debug')->state(fn (Inquiry $record) => $this->prettyJson($record->extraction_debug))->columnSpanFull()->prose()->copyable(),
+                                                ]),
+
+                                            Section::make('AI Audit (ai_inquiries)')
+                                                ->collapsible()
+                                                ->collapsed()
+                                                ->schema([
+                                                    TextEntry::make('ai_status')->label('ai_inquiries.status')->state(fn (Inquiry $record) => (string) ($record->aiInquiry?->status ?? '-')),
+                                                    TextEntry::make('ai_intent')->label('ai_inquiries.intent')->state(fn (Inquiry $record) => (string) ($record->aiInquiry?->intent ?? '-')),
+                                                    TextEntry::make('ai_oos')->label('ai_inquiries.out_of_scope_reason')->state(fn (Inquiry $record) => (string) ($record->aiInquiry?->out_of_scope_reason ?? '-'))->columnSpanFull(),
+                                                    TextEntry::make('ai_missing_fields')->label('ai_inquiries.missing_fields')->state(fn (Inquiry $record) => $this->prettyJson($record->aiInquiry?->missing_fields))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('ai_parse_warnings')->label('ai_inquiries.parse_warnings')->state(fn (Inquiry $record) => $this->prettyJson($record->aiInquiry?->parse_warnings))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('ai_parsed_payload')->label('ai_inquiries.parsed_payload')->state(fn (Inquiry $record) => $this->prettyJson($record->aiInquiry?->parsed_payload))->columnSpanFull()->prose()->copyable(),
+                                                    TextEntry::make('ai_suggestions_payload')->label('ai_inquiries.suggestions_payload')->state(fn (Inquiry $record) => $this->prettyJson($record->aiInquiry?->suggestions_payload))->columnSpanFull()->prose()->copyable(),
+                                                    Grid::make()->columns(2)->schema([
+                                                        TextEntry::make('ai_parsed_at')->label('ai_inquiries.parsed_at')->state(fn (Inquiry $record) => optional($record->aiInquiry?->parsed_at)->format('d.m.Y H:i') ?: '-'),
+                                                        TextEntry::make('ai_suggested_at')->label('ai_inquiries.suggested_at')->state(fn (Inquiry $record) => optional($record->aiInquiry?->suggested_at)->format('d.m.Y H:i') ?: '-'),
+                                                    ]),
                                                 ]),
                                         ])
                                         ->columnSpan(1),
@@ -715,8 +1026,57 @@ class ViewInquiry extends ViewRecord
         ]);
     }
 
+    private function formatUnitsSummary(Inquiry $record): ?string
+    {
+        $units = data_get($record, 'units', []);
+        if (! is_array($units) || count($units) < 2) return null;
+
+        return collect($units)->map(function ($u, $i) {
+            $g = data_get($u, 'party_group', []);
+            $a = (int) data_get($g, 'adults', 0);
+            $c = (int) data_get($g, 'children', 0);
+
+            $ages = data_get($g, 'children_ages', []);
+            $ages = is_array($ages) ? array_values($ages) : [];
+            $agesTxt = $c > 0 ? (count($ages) ? implode(', ', $ages) : '—') : '—';
+
+            $req = data_get($g, 'requirements', []);
+            $req = is_array($req) ? array_filter(array_map('trim', $req)) : [];
+            $reqTxt = count($req) ? (' | ' . implode(' / ', $req)) : '';
+
+            return 'Jedinica ' . ($i + 1) . ": {$a} odraslih, {$c} dece (uzrast: {$agesTxt}){$reqTxt}";
+        })->implode("\n");
+    }
+
+    private function formatGroupsSummary(Inquiry $record): ?string
+    {
+        $groups = data_get($record, 'party.groups', []);
+        if (is_string($groups)) {
+            $decoded = json_decode($groups, true);
+            $groups = is_array($decoded) ? $decoded : [];
+        }
+        if (! is_array($groups) || count($groups) < 2) return null;
+
+        return collect($groups)->map(function ($g, $i) {
+            $a = (int) data_get($g, 'adults', 0);
+            $c = (int) data_get($g, 'children', 0);
+
+            $ages = data_get($g, 'children_ages', []);
+            $ages = is_array($ages) ? array_values($ages) : [];
+            $agesTxt = $c > 0 ? (count($ages) ? implode(', ', $ages) : '—') : '—';
+
+            $req = data_get($g, 'requirements', []);
+            $req = is_array($req) ? array_filter(array_map('trim', $req)) : [];
+            $reqTxt = count($req) ? (' | ' . implode(' / ', $req)) : '';
+
+            return 'Porodica ' . ($i + 1) . ": {$a} odraslih, {$c} dece (uzrast: {$agesTxt}){$reqTxt}";
+        })->implode("\n");
+    }
+
     private function prefillQuickEditForm(Inquiry $i): array
     {
+        $toSelect = fn ($v) => $v === null ? '' : ($v ? '1' : '0');
+
         return [
             'region' => $i->region,
             'location' => $i->location,
@@ -729,14 +1089,39 @@ class ViewInquiry extends ViewRecord
             'children_ages' => is_array($i->children_ages) ? implode(', ', $i->children_ages) : $i->children_ages,
             'budget_min' => $i->budget_min,
             'budget_max' => $i->budget_max,
-            'wants_near_beach' => $i->wants_near_beach,
-            'wants_parking' => $i->wants_parking,
-            'wants_quiet' => $i->wants_quiet,
-            'wants_pets' => $i->wants_pets,
-            'wants_pool' => $i->wants_pool,
+
+            'wants_near_beach' => $toSelect($i->wants_near_beach),
+            'wants_parking' => $toSelect($i->wants_parking),
+            'wants_quiet' => $toSelect($i->wants_quiet),
+            'wants_pets' => $toSelect($i->wants_pets),
+            'wants_pool' => $toSelect($i->wants_pool),
+
             'special_requirements' => $i->special_requirements,
             'reply_mode' => $i->reply_mode,
             'status' => $i->status,
         ];
+    }
+
+    private function prettyJson($state): string
+    {
+        if ($state === null) return '-';
+
+        if (is_string($state)) {
+            $trim = trim($state);
+            if ($trim === '') return '-';
+
+            $decoded = json_decode($trim, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                return json_encode($decoded, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) ?: $trim;
+            }
+
+            return $trim;
+        }
+
+        if (is_array($state) || is_object($state)) {
+            return json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE) ?: '-';
+        }
+
+        return (string) $state;
     }
 }

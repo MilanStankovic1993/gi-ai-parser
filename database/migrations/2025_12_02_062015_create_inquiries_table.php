@@ -31,7 +31,21 @@ return new class extends Migration
             // AI draft (edit/copy/send)
             $table->longText('ai_draft')->nullable();
 
-            // Summary polja (AI popunjava)
+            /**
+             * ŠIRA SLIKA (kanonski contract za extraction + search)
+             * Ovo je “izvor istine” za sve realne scenarije mailova.
+             */
+            $table->string('intent', 50)->nullable()->index();     // specific_property|standard_search|long_stay_private|owner_request|spam|unknown
+            $table->json('entities')->nullable();                  // [{type, value, url, confidence}, ...]
+            $table->json('travel_time')->nullable();               // {date_from/date_to OR date_window, nights_min/max, stay_type, confidence}
+            $table->json('party')->nullable();                     // {adults, children, ages, groups, units_requested, room_notes, confidence}
+            $table->json('units')->nullable();
+            $table->json('wishes')->nullable();                    // tri-state flags: true/false/null
+            $table->json('questions')->nullable();                 // ["deposit","guarantee",...]
+            $table->json('tags')->nullable();                      // ["family","group","flexible",...]
+            $table->json('why_no_offer')->nullable();              // ["missing_dates","missing_party",...]
+
+            // Summary polja (AI popunjava) – ostavljamo za UI/filtere
             $table->string('region', 255)->nullable();
             $table->string('location', 255)->nullable();
             $table->date('date_from')->nullable();
@@ -49,7 +63,11 @@ return new class extends Migration
             $table->unsignedInteger('budget_min')->nullable();
             $table->unsignedInteger('budget_max')->nullable();
 
-            // Wants / flags
+            /**
+             * Wants / flags – ostavljamo radi kompatibilnosti,
+             * ALI: u extractor/mapping logici mora da bude tri-state (true/false/null).
+             * Nikad ne upisivati false ako nije eksplicitno pomenuto.
+             */
             $table->boolean('wants_near_beach')->nullable();
             $table->boolean('wants_parking')->nullable();
             $table->boolean('wants_quiet')->nullable();
@@ -68,7 +86,7 @@ return new class extends Migration
                 'suggested',
                 'replied',
                 'closed',
-                'no_ai',      // limit reached / ai stopped / ručno
+                'no_ai',
             ])->default('new');
 
             // Način odgovora
@@ -91,6 +109,7 @@ return new class extends Migration
             // Indexi
             $table->index(['status', 'received_at']);
             $table->index('guest_email');
+            $table->index(['status', 'intent']);
         });
     }
 

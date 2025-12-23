@@ -13,73 +13,91 @@ class InquiryAiExtractor
     public function extract(Inquiry $inquiry): array
     {
         $text = trim((string) ($inquiry->raw_message ?? ''));
-
         if ($text === '') {
             return $this->fallbackExtract($inquiry);
         }
 
-        // AI toggle (radi i preko config i preko env)
         $aiEnabled =
             (bool) config('app.ai_enabled', false) ||
             (string) env('AI_ENABLED', 'false') === 'true';
-
-        Log::info('AI toggle runtime', [
-            'ai_enabled'      => $aiEnabled,
-            'app_ai_enabled'  => config('app.ai_enabled'),
-            'env_ai_enabled'  => env('AI_ENABLED'),
-            'openai_key_set'  => (bool) config('services.openai.key'),
-            'openai_model'    => config('services.openai.model'),
-            'inquiry_id'      => $inquiry->id ?? null,
-        ]);
 
         if (! $aiEnabled) {
             return $this->fallbackExtract($inquiry);
         }
 
-        $apiKey = config('services.openai.key');
-        $model  = config('services.openai.model', 'gpt-4.1');
+        $apiKey = (string) config('services.openai.key');
+        $model  = (string) config('services.openai.model', 'gpt-4.1');
 
-        if (! $apiKey) {
+        if (trim($apiKey) === '') {
             return $this->fallbackExtract($inquiry);
         }
 
-        // hard cap da ne šaljemo ogromne thread-ove / potpise
-        $textForAi = Str::of($text)->replace("\r", "\n")->squish()->limit(7000)->toString();
+        $textForAi = Str::of($text)
+            ->replace("\r", "\n")
+            ->squish()
+            ->limit(9000)
+            ->toString();
 
-        // koristimo received_at (ako postoji) kao "danas" – bitno za upite iz IMAP-a
         $today = $inquiry->received_at
             ? Carbon::parse($inquiry->received_at)->toDateString()
             : now()->toDateString();
 
         $system = <<<SYS
-Ti si asistent za GrckaInfo. Iz jedne poruke gosta treba da izvučeš strukturisane parametre za ponudu smeštaja.
+Ti si asistent za GrckaInfo. Iz poruke gosta izvuci parametre kao "kandidate" (nizove), da bi backend mogao da proba vise kombinacija u bazi.
 
 Vrati ISKLJUČIVO validan JSON (bez objašnjenja, bez markdown-a).
-Sva polja koja nisu poznata vrati kao null.
 
-DATUMI:
-- Ako je naveden interval "od-do" vrati date_from i date_to kao YYYY-MM-DD.
-- Ako je naveden samo okvirni period (npr. "sredina jula", "druga polovina juna", "početak avgusta") a nema tačnih dana:
-  date_from = null, date_to = null i upiši taj opis u month_hint (string).
+OBAVEZNO:
+- property_candidates: niz naziva smeštaja (ako gost pominje), svaki element: { "query": string, "confidence": 0..1 }
+- location_candidates: niz mesta/oblasti (sr/en/gr kako god gost napise), { "query": string, "confidence": 0..1 }
+- region_candidates: niz regija (ako postoje), { "query": string, "confidence": 0..1 }
+- date_candidates: niz kandidata za period:
+  - ili { "from":"YYYY-MM-DD", "to":"YYYY-MM-DD", "confidence":0..1 }
+  - ili { "from_window":{"from":"YYYY-MM-DD","to":"YYYY-MM-DD"}, "nights":int|null, "confidence":0..1 }
 
-OSOBE:
-- adults: broj odraslih (int|null)
-- children: broj dece (int|null)
-- children_ages: niz uzrasta [5,3] ako je pomenuto, inače [] (prazan niz). Ako nema informacije, vrati [].
+- party: objekat sa više grupa (za više porodica / više apartmana):
+  {
+    "units_needed": int|null,
+    "groups": [
+      {
+        "adults": int|null,
+        "children": int|null,
+        "children_ages": int[],
+        "requirements": string[]
+      }
+    ],
+    "confidence": 0..1
+  }
 
-BUDŽET:
-- budget_min / budget_max kao int (EUR) ili null ako nije navedeno.
+✅ KLJUČNO (DA BI SE RADILE ODVOJENE PRETRAGE):
+- units: niz (jedan element = jedna porodica/jedinica/apartman koji tražimo)
+  Svaki element:
+  {
+    "unit_index": int,  // 1..N
+    "party_group": {
+      "adults": int|null,
+      "children": int|null,
+      "children_ages": int[],
+      "requirements": string[]
+    },
+    "property_candidates": [ { "query": string, "confidence": 0..1 } ],
+    "wishes_override": {near_beach, parking, quiet, pets, pool, separate_bedroom} true/false/null | null
+  }
 
-LOKACIJA:
-- region: oblast/regija (string|null)
-- location: mesto/naselje (string|null)
+PRAVILO MAPIRANJA:
+- Ako party.groups ima N elemenata i property_candidates ima N elemenata, OBAVEZNO:
+  - units.length = N
+  - units[i].party_group = party.groups[i]
+  - units[i].property_candidates = [ property_candidates[i] ]
+- Ako nije jasno mapiranje: vrati units sa party_group, a property_candidates ostavi prazno ili kopiraj globalno.
 
-ŽELJE:
-- wants_near_beach, wants_parking, wants_quiet, wants_pets, wants_pool kao true/false/null (null ako nije pomenuto)
+- wishes: tri-state {near_beach, parking, quiet, pets, pool, separate_bedroom} true/false/null
+- questions: niz tagova pitanja (deposit, guarantee, availability, price, payment, cancellation)
+- intent: specific_property | standard_search | long_stay_private | owner_request | spam | unknown
+- language: "sr" ili "en" (ili null)
 
-OSTALO:
-- special_requirements: kratak slobodan tekst ili null
-- language: "sr" ili "en" (ili null ako nisi siguran)
+Kompatibilnost:
+- Popuni i legacy polja (region, location, date_from, date_to, nights, adults, children, children_ages, budget_min, budget_max, wants_*) na osnovu najboljeg kandidata.
 SYS;
 
         $user = <<<USR
@@ -89,6 +107,28 @@ PORUKA GOSTA:
 {$textForAi}
 
 Vrati JSON sa poljima:
+intent,
+out_of_scope_reason,
+
+property_candidates,
+location_candidates,
+region_candidates,
+date_candidates,
+
+party,
+units,
+
+wishes,
+questions,
+tags,
+why_no_offer,
+
+budget_min,
+budget_max,
+
+language,
+
+// legacy:
 region,
 location,
 month_hint,
@@ -98,15 +138,12 @@ nights,
 adults,
 children,
 children_ages,
-budget_min,
-budget_max,
 wants_near_beach,
 wants_parking,
 wants_quiet,
 wants_pets,
 wants_pool,
-special_requirements,
-language
+special_requirements
 USR;
 
         try {
@@ -130,7 +167,9 @@ USR;
                 Log::warning('InquiryAiExtractor: OpenAI non-success', [
                     'status' => $resp->status(),
                     'inquiry_id' => $inquiry->id ?? null,
+                    'body' => $resp->body(),
                 ]);
+
                 return $this->fallbackExtract($inquiry);
             }
 
@@ -144,48 +183,10 @@ USR;
                 return $this->fallbackExtract($inquiry);
             }
 
-            $out = $this->normalizeAiOutput($json);
-
-            // deterministic checkout: date_to = date_from + nights ako fali
-            if ($out['date_from'] && $out['nights'] && ! $out['date_to']) {
-                try {
-                    $out['date_to'] = Carbon::parse($out['date_from'])
-                        ->addDays((int) $out['nights'])
-                        ->toDateString();
-                } catch (\Throwable) {
-                    // ignore
-                }
-            }
-
-            // ✅ KLJUČ: ako je AI dao datum u prošlosti (u odnosu na primljeni upit), prebaci na sledeću godinu
-            [$df, $dt] = $this->normalizeFutureDates(
-                $out['date_from'],
-                $out['date_to'],
-                $out['nights'],
-                $inquiry->received_at ? Carbon::parse($inquiry->received_at) : null
-            );
-            $out['date_from'] = $df;
-            $out['date_to']   = $dt;
-
-            // minimalni SAFE fallback dopune (ne diramo ključne parametre)
-            if ($out['budget_min'] === null && $out['budget_max'] === null) {
-                $b = $this->extractBudgetFromText($text);
-                $out['budget_min'] = $b['budget_min'];
-                $out['budget_max'] = $b['budget_max'];
-            }
-
-            // wants: samo dopuni null-ove heuristikom
-            $fallbackWants = $this->extractWantsFromText($text);
-            foreach ($fallbackWants as $k => $v) {
-                if (array_key_exists($k, $out) && $out[$k] === null) {
-                    $out[$k] = $v;
-                }
-            }
-
-            // language fallback
-            $out['language'] = $out['language'] ?: $this->guessLanguage($text);
+            [$out, $warnings] = $this->normalizeAiOutputV3($json, $text, $inquiry);
 
             $out['_mode'] = 'ai';
+            $out['_warnings'] = $warnings;
 
             return $out;
         } catch (\Throwable $e) {
@@ -193,99 +194,455 @@ USR;
                 'inquiry_id' => $inquiry->id ?? null,
                 'message' => $e->getMessage(),
             ]);
+
             return $this->fallbackExtract($inquiry);
         }
     }
 
     /**
-     * Ako su datumi u prošlosti u odnosu na received_at (ili now), prebaci ih +1 godinu.
-     * Tolerancija: 7 dana.
+     * @return array{0: array, 1: array}
      */
-    private function normalizeFutureDates(?string $dateFrom, ?string $dateTo, ?int $nights, ?Carbon $receivedAt = null): array
+    private function normalizeAiOutputV3(array $data, string $rawText, Inquiry $inquiry): array
     {
-        if (! $dateFrom) {
-            return [$dateFrom, $dateTo];
+        $warnings = [];
+
+        $intent = $this->nullIfEmpty(data_get($data, 'intent'));
+        if (! in_array($intent, ['specific_property', 'standard_search', 'long_stay_private', 'owner_request', 'spam', 'unknown'], true)) {
+            $intent = 'unknown';
         }
 
-        try {
-            $from = Carbon::parse($dateFrom)->startOfDay();
-        } catch (\Throwable) {
-            return [null, null];
+        $propertyCandidates = $this->sortCandidatesByConfidence(
+            $this->normalizeCandidateList(data_get($data, 'property_candidates'))
+        );
+        $locationCandidates = $this->sortCandidatesByConfidence(
+            $this->normalizeCandidateList(data_get($data, 'location_candidates'))
+        );
+        $regionCandidates   = $this->sortCandidatesByConfidence(
+            $this->normalizeCandidateList(data_get($data, 'region_candidates'))
+        );
+        $dateCandidates     = $this->sortDateCandidatesByConfidence(
+            $this->normalizeDateCandidates(data_get($data, 'date_candidates'))
+        );
+
+        // party (groups)
+        $partyRaw = $this->normalizeObject(data_get($data, 'party'), []);
+
+        $unitsNeeded = $this->normalizeInt(data_get($partyRaw, 'units_needed'));
+        $groups      = $this->normalizePartyGroups(data_get($partyRaw, 'groups'));
+
+        $partyConfidence = data_get($partyRaw, 'confidence');
+        $partyConfidence = is_numeric($partyConfidence) ? max(0, min(1, (float) $partyConfidence)) : null;
+
+        // totals derived from groups (kompatibilnost)
+        [$adults, $children, $ages] = $this->derivePartyTotalsFromGroups($groups);
+
+        if (empty($groups)) {
+            $warnings[] = 'party.groups missing; derived party totals from legacy adults/children/children_ages if present';
+
+            $adults   = $adults   ?? $this->normalizeInt(data_get($data, 'adults'));
+            $children = $children ?? $this->normalizeInt(data_get($data, 'children'));
+
+            $agesFromLegacy = $this->normalizeAgesToArray(data_get($data, 'children_ages'));
+            if (! empty($agesFromLegacy)) {
+                $ages = array_values(array_unique(array_merge($ages, $agesFromLegacy)));
+            }
+
+            $groups = [[
+                'adults' => $adults,
+                'children' => $children,
+                'children_ages' => $agesFromLegacy,
+                'requirements' => [],
+            ]];
         }
 
-        $to = null;
-        if ($dateTo) {
-            try {
-                $to = Carbon::parse($dateTo)->startOfDay();
-            } catch (\Throwable) {
-                $to = null;
+        if ($unitsNeeded === null && count($groups) > 1) {
+            $unitsNeeded = count($groups);
+        }
+
+        $party = [
+            'units_needed' => $unitsNeeded,
+            'adults' => $adults,
+            'children' => $children,
+            'children_ages' => $ages,
+            'groups' => $groups,
+            'confidence' => $partyConfidence,
+        ];
+
+        // wishes
+        $wishesRaw = $this->normalizeObject(data_get($data, 'wishes'), []);
+        $wishes = [
+            'near_beach' => $this->normalizeBool(data_get($wishesRaw, 'near_beach')),
+            'parking'    => $this->normalizeBool(data_get($wishesRaw, 'parking')),
+            'quiet'      => $this->normalizeBool(data_get($wishesRaw, 'quiet')),
+            'pets'       => $this->normalizeBool(data_get($wishesRaw, 'pets')),
+            'pool'       => $this->normalizeBool(data_get($wishesRaw, 'pool')),
+            'separate_bedroom' => $this->normalizeBool(data_get($wishesRaw, 'separate_bedroom')),
+        ];
+
+        $questions = $this->normalizeStringArray(data_get($data, 'questions'));
+        $tags      = $this->normalizeStringArray(data_get($data, 'tags'));
+        $why       = $this->normalizeStringArray(data_get($data, 'why_no_offer'));
+
+        $budgetMin = $this->normalizeInt(data_get($data, 'budget_min'));
+        $budgetMax = $this->normalizeInt(data_get($data, 'budget_max'));
+
+        // LEGACY best
+        $bestLoc = $locationCandidates[0]['query'] ?? $this->nullIfEmpty(data_get($data, 'location'));
+        $bestReg = $regionCandidates[0]['query'] ?? $this->nullIfEmpty(data_get($data, 'region'));
+
+        $bestDateFrom = $this->normalizeDate(data_get($data, 'date_from'));
+        $bestDateTo   = $this->normalizeDate(data_get($data, 'date_to'));
+        $bestNights   = $this->normalizeInt(data_get($data, 'nights'));
+
+        $bestWindow = null;
+
+        if (empty($bestDateFrom) && empty($bestDateTo) && ! empty($dateCandidates)) {
+            $dc0 = $dateCandidates[0];
+
+            if (! empty($dc0['from']) && ! empty($dc0['to'])) {
+                $bestDateFrom = $dc0['from'];
+                $bestDateTo   = $dc0['to'];
+            } elseif (! empty($dc0['from_window']['from']) && ! empty($dc0['from_window']['to'])) {
+                $bestWindow = $dc0['from_window'];
+                $warnings[] = 'Only date window provided; legacy date_from/date_to left null';
+            }
+
+            if (empty($bestNights) && array_key_exists('nights', $dc0)) {
+                $bestNights = $this->normalizeInt($dc0['nights']);
             }
         }
 
-        $ref = ($receivedAt ?: now())->startOfDay();
-
-        // ako je "from" dovoljno u prošlosti, shift +1 godinu
-        if ($from->lt($ref->copy()->subDays(7))) {
-            $from->addYear();
-            if ($to) {
-                $to->addYear();
-            } elseif ($nights) {
-                $to = $from->copy()->addDays((int) $nights);
-            }
+        if ($bestDateFrom) {
+            [$df, $dt] = $this->normalizeFutureDates(
+                $bestDateFrom,
+                $bestDateTo,
+                $bestNights,
+                $inquiry->received_at ? Carbon::parse($inquiry->received_at) : null
+            );
+            $bestDateFrom = $df;
+            $bestDateTo   = $dt;
         }
 
-        return [$from->toDateString(), $to?->toDateString()];
+        // wants_* from wishes (tri-state)
+        $wantsNear  = $this->normalizeBool(data_get($data, 'wants_near_beach'));
+        $wantsPark  = $this->normalizeBool(data_get($data, 'wants_parking'));
+        $wantsQuiet = $this->normalizeBool(data_get($data, 'wants_quiet'));
+        $wantsPets  = $this->normalizeBool(data_get($data, 'wants_pets'));
+        $wantsPool  = $this->normalizeBool(data_get($data, 'wants_pool'));
+
+        if ($wantsNear === null)  $wantsNear  = $wishes['near_beach'];
+        if ($wantsPark === null)  $wantsPark  = $wishes['parking'];
+        if ($wantsQuiet === null) $wantsQuiet = $wishes['quiet'];
+        if ($wantsPets === null)  $wantsPets  = $wishes['pets'];
+        if ($wantsPool === null)  $wantsPool  = $wishes['pool'];
+
+        $language = $this->nullIfEmpty(data_get($data, 'language')) ?: $this->guessLanguage($rawText);
+
+        // intent auto-fix
+        if ($intent === 'standard_search' && ! empty($propertyCandidates)) {
+            $intent = 'specific_property';
+            $warnings[] = 'Intent adjusted to specific_property based on property_candidates';
+        }
+        if ($intent === 'unknown') {
+            $intent = ! empty($propertyCandidates) ? 'specific_property' : 'standard_search';
+        }
+
+        // entities + travel_time (kanon)
+        $entities = [
+            'property_candidates' => $propertyCandidates,
+            'location_candidates' => $locationCandidates,
+            'region_candidates'   => $regionCandidates,
+            'date_candidates'     => $dateCandidates,
+        ];
+
+        $travelTime = [
+            'date_from'   => $bestDateFrom,
+            'date_to'     => $bestDateTo,
+            'date_window' => $bestWindow,
+            'nights'      => $bestNights,
+        ];
+
+        // ✅ UNITS (najvažnije)
+        $units = $this->normalizeUnits(
+            data_get($data, 'units'),
+            $groups,
+            $propertyCandidates,
+            $wishes
+        );
+
+        if (empty($units) && !empty($groups)) {
+            $warnings[] = 'units missing; built deterministically from party.groups and property_candidates';
+        }
+
+        $out = [
+            'intent' => $intent,
+            'out_of_scope_reason' => $this->nullIfEmpty(data_get($data, 'out_of_scope_reason')),
+
+            'entities' => $entities,
+            'travel_time' => $travelTime,
+
+            'party' => $party,
+            'units' => $units, // ✅
+
+            'wishes' => $wishes,
+            'questions' => $questions,
+            'tags' => $tags,
+            'why_no_offer' => $why,
+
+            // dodatno
+            'property_candidates' => $propertyCandidates,
+            'location_candidates' => $locationCandidates,
+            'region_candidates'   => $regionCandidates,
+            'date_candidates'     => $dateCandidates,
+
+            'budget_min' => $budgetMin,
+            'budget_max' => $budgetMax,
+            'language' => $language,
+
+            // legacy
+            'region' => $bestReg,
+            'location' => $bestLoc,
+            'month_hint' => $this->nullIfEmpty(data_get($data, 'month_hint')),
+            'date_from' => $bestDateFrom,
+            'date_to' => $bestDateTo,
+            'nights' => $bestNights,
+
+            'adults' => $adults,
+            'children' => $children,
+            'children_ages' => $ages,
+
+            'wants_near_beach' => $wantsNear,
+            'wants_parking'    => $wantsPark,
+            'wants_quiet'      => $wantsQuiet,
+            'wants_pets'       => $wantsPets,
+            'wants_pool'       => $wantsPool,
+
+            'special_requirements' => $this->nullIfEmpty(data_get($data, 'special_requirements')),
+        ];
+
+        return [$out, $warnings];
     }
 
     /**
-     * Normalizuje strogo AI output (bez "izmišljanja" ključnih parametara).
+     * units:
+     * - ako AI da validno -> normalizuj
+     * - ako ne -> deterministički:
+     *   - ako groups N i propertyCandidates N -> 1:1 map
+     *   - else -> units iz groups, propertyCandidates prazno (ili global kopija)
      */
-    private function normalizeAiOutput(array $data): array
+    private function normalizeUnits($v, array $groups, array $propertyCandidates, array $wishes): array
     {
-        $out = [
-            'region' => $this->nullIfEmpty(data_get($data, 'region')),
-            'location' => $this->nullIfEmpty(data_get($data, 'location')),
-            'month_hint' => $this->nullIfEmpty(data_get($data, 'month_hint')),
+        // 1) ako AI vrati units
+        if (is_string($v)) {
+            $decoded = json_decode($v, true);
+            $v = is_array($decoded) ? $decoded : null;
+        }
 
-            'date_from' => $this->normalizeDate(data_get($data, 'date_from')),
-            'date_to' => $this->normalizeDate(data_get($data, 'date_to')),
-            'nights' => $this->normalizeInt(data_get($data, 'nights')),
+        if (is_array($v) && !empty($v)) {
+            $out = [];
+            $i = 0;
 
-            'adults' => $this->normalizeInt(data_get($data, 'adults')),
-            'children' => $this->normalizeInt(data_get($data, 'children')),
+            foreach ($v as $row) {
+                $i++;
+                if (!is_array($row)) continue;
 
-            'children_ages' => $this->normalizeAgesToArray(data_get($data, 'children_ages')),
+                $unitIndex = $this->normalizeInt($row['unit_index'] ?? $i) ?? $i;
 
-            'budget_min' => $this->normalizeInt(data_get($data, 'budget_min')),
-            'budget_max' => $this->normalizeInt(data_get($data, 'budget_max')),
+                $pg = $row['party_group'] ?? null;
+                $pg = is_array($pg) ? $pg : [];
 
-            'wants_near_beach' => $this->normalizeBool(data_get($data, 'wants_near_beach')),
-            'wants_parking'    => $this->normalizeBool(data_get($data, 'wants_parking')),
-            'wants_quiet'      => $this->normalizeBool(data_get($data, 'wants_quiet')),
-            'wants_pets'       => $this->normalizeBool(data_get($data, 'wants_pets')),
-            'wants_pool'       => $this->normalizeBool(data_get($data, 'wants_pool')),
+                $partyGroup = [
+                    'adults' => $this->normalizeInt($pg['adults'] ?? null),
+                    'children' => $this->normalizeInt($pg['children'] ?? null),
+                    'children_ages' => $this->normalizeAgesToArray($pg['children_ages'] ?? null),
+                    'requirements' => $this->normalizeStringArray($pg['requirements'] ?? []),
+                ];
 
-            'special_requirements' => $this->nullIfEmpty(data_get($data, 'special_requirements')),
-            'language' => $this->nullIfEmpty(data_get($data, 'language')),
-        ];
+                $pc = $this->normalizeCandidateList($row['property_candidates'] ?? []);
+                $pc = $this->sortCandidatesByConfidence($pc);
 
-        // ako imamo tačne datume, month_hint čistimo (da nema konflikta)
-        if ($out['date_from'] && $out['date_to']) {
-            $out['month_hint'] = null;
+                $wo = $row['wishes_override'] ?? null;
+                $wo = is_array($wo) ? [
+                    'near_beach' => $this->normalizeBool($wo['near_beach'] ?? null),
+                    'parking' => $this->normalizeBool($wo['parking'] ?? null),
+                    'quiet' => $this->normalizeBool($wo['quiet'] ?? null),
+                    'pets' => $this->normalizeBool($wo['pets'] ?? null),
+                    'pool' => $this->normalizeBool($wo['pool'] ?? null),
+                    'separate_bedroom' => $this->normalizeBool($wo['separate_bedroom'] ?? null),
+                ] : null;
 
-            if (! $out['nights']) {
-                try {
-                    $df = Carbon::parse($out['date_from']);
-                    $dt = Carbon::parse($out['date_to']);
-                    $n = $df->diffInDays($dt);
-                    $out['nights'] = $n > 0 ? $n : null;
-                } catch (\Throwable) {
-                    // ignore
-                }
+                $out[] = [
+                    'unit_index' => $unitIndex,
+                    'party_group' => $partyGroup,
+                    'property_candidates' => $pc,
+                    'wishes_override' => $wo,
+                ];
+            }
+
+            // ako je prazno posle normalizacije -> padni na deterministic
+            if (!empty($out)) {
+                return $out;
+            }
+        }
+
+        // 2) deterministički fallback
+        $out = [];
+
+        $gN = count($groups);
+        $pN = count($propertyCandidates);
+
+        // N==N -> 1:1 map (tvoj scenario)
+        if ($gN > 0 && $pN > 0 && $gN === $pN) {
+            for ($i = 0; $i < $gN; $i++) {
+                $out[] = [
+                    'unit_index' => $i + 1,
+                    'party_group' => [
+                        'adults' => $groups[$i]['adults'] ?? null,
+                        'children' => $groups[$i]['children'] ?? null,
+                        'children_ages' => $groups[$i]['children_ages'] ?? [],
+                        'requirements' => $groups[$i]['requirements'] ?? [],
+                    ],
+                    'property_candidates' => [ $propertyCandidates[$i] ],
+                    'wishes_override' => null,
+                ];
+            }
+            return $out;
+        }
+
+        // samo groups
+        if ($gN > 0) {
+            for ($i = 0; $i < $gN; $i++) {
+                $out[] = [
+                    'unit_index' => $i + 1,
+                    'party_group' => [
+                        'adults' => $groups[$i]['adults'] ?? null,
+                        'children' => $groups[$i]['children'] ?? null,
+                        'children_ages' => $groups[$i]['children_ages'] ?? [],
+                        'requirements' => $groups[$i]['requirements'] ?? [],
+                    ],
+                    // ako nema mapiranja, ostavi prazno (ili kopiraj globalno ako želiš)
+                    'property_candidates' => [],
+                    'wishes_override' => null,
+                ];
+            }
+            return $out;
+        }
+
+        // nema ničega
+        return [];
+    }
+
+    private function normalizeCandidateList($v): array
+    {
+        if ($v === null) return [];
+        if (is_string($v)) {
+            $decoded = json_decode($v, true);
+            $v = is_array($decoded) ? $decoded : [$v];
+        }
+        if (! is_array($v)) return [];
+
+        $out = [];
+        foreach ($v as $row) {
+            if (is_string($row)) {
+                $q = trim($row);
+                if ($q !== '') $out[] = ['query' => $q, 'confidence' => null];
+                continue;
+            }
+
+            if (! is_array($row)) continue;
+
+            $q = trim((string) ($row['query'] ?? $row['value'] ?? ''));
+            if ($q === '') continue;
+
+            $c = $row['confidence'] ?? null;
+            $c = is_numeric($c) ? max(0, min(1, (float) $c)) : null;
+
+            $out[] = ['query' => $q, 'confidence' => $c];
+        }
+
+        // unique by query
+        $uniq = [];
+        foreach ($out as $r) {
+            $k = mb_strtolower($r['query']);
+            if (! array_key_exists($k, $uniq)) {
+                $uniq[$k] = $r;
+            }
+        }
+
+        return array_values($uniq);
+    }
+
+    private function normalizeDateCandidates($v): array
+    {
+        if ($v === null) return [];
+        if (is_string($v)) {
+            $decoded = json_decode($v, true);
+            $v = is_array($decoded) ? $decoded : [];
+        }
+        if (! is_array($v)) return [];
+
+        $out = [];
+        foreach ($v as $row) {
+            if (! is_array($row)) continue;
+
+            $conf = $row['confidence'] ?? null;
+            $conf = is_numeric($conf) ? max(0, min(1, (float) $conf)) : null;
+
+            $from = $this->normalizeDate($row['from'] ?? null);
+            $to   = $this->normalizeDate($row['to'] ?? null);
+
+            $fw = $row['from_window'] ?? null;
+            $fwFrom = is_array($fw) ? $this->normalizeDate($fw['from'] ?? null) : null;
+            $fwTo   = is_array($fw) ? $this->normalizeDate($fw['to'] ?? null) : null;
+
+            $nights = $this->normalizeInt($row['nights'] ?? null);
+
+            if ($from && $to) {
+                $out[] = ['from' => $from, 'to' => $to, 'confidence' => $conf];
+            } elseif ($fwFrom && $fwTo) {
+                $out[] = [
+                    'from_window' => ['from' => $fwFrom, 'to' => $fwTo],
+                    'nights' => $nights,
+                    'confidence' => $conf,
+                ];
             }
         }
 
         return $out;
+    }
+
+    // ---------------------------
+    // Helpers
+    // ---------------------------
+
+    private function sortCandidatesByConfidence(array $candidates): array
+    {
+        usort($candidates, function ($a, $b) {
+            $ca = $a['confidence'] ?? null;
+            $cb = $b['confidence'] ?? null;
+
+            $ca = is_numeric($ca) ? (float) $ca : -1.0;
+            $cb = is_numeric($cb) ? (float) $cb : -1.0;
+
+            return $cb <=> $ca;
+        });
+
+        return $candidates;
+    }
+
+    private function sortDateCandidatesByConfidence(array $candidates): array
+    {
+        usort($candidates, function ($a, $b) {
+            $ca = $a['confidence'] ?? null;
+            $cb = $b['confidence'] ?? null;
+
+            $ca = is_numeric($ca) ? (float) $ca : -1.0;
+            $cb = is_numeric($cb) ? (float) $cb : -1.0;
+
+            return $cb <=> $ca;
+        });
+
+        return $candidates;
     }
 
     private function decodeJsonSafely(string $content): ?array
@@ -301,6 +658,44 @@ USR;
 
         $decoded = json_decode($c, true);
         return is_array($decoded) ? $decoded : null;
+    }
+
+    private function normalizeObject($v, array $default = []): array
+    {
+        if ($v === null) return $default;
+        if (is_array($v)) return $v;
+
+        if (is_string($v)) {
+            $decoded = json_decode($v, true);
+            return is_array($decoded) ? $decoded : $default;
+        }
+
+        return $default;
+    }
+
+    private function normalizeStringArray($v): array
+    {
+        if ($v === null) return [];
+
+        if (is_string($v)) {
+            $decoded = json_decode($v, true);
+            if (is_array($decoded)) {
+                $v = $decoded;
+            } else {
+                $v = preg_split('/[,;\n]+/u', $v) ?: [];
+            }
+        }
+
+        if (! is_array($v)) return [];
+
+        $out = [];
+        foreach ($v as $item) {
+            if (! is_string($item)) continue;
+            $s = trim($item);
+            if ($s !== '') $out[] = $s;
+        }
+
+        return array_values(array_unique($out));
     }
 
     private function normalizeInt($v): ?int
@@ -347,13 +742,11 @@ USR;
     private function nullIfEmpty($v): ?string
     {
         if (! is_string($v)) return null;
+
         $v = trim($v);
         return $v === '' ? null : $v;
     }
 
-    /**
-     * UVEK vraća array ([]) – nikad null.
-     */
     private function normalizeAgesToArray($v): array
     {
         if ($v === null) return [];
@@ -373,378 +766,136 @@ USR;
         $ages = [];
         foreach ($v as $item) {
             $n = $this->normalizeInt($item);
-            if ($n !== null && $n >= 0 && $n <= 25) {
-                $ages[] = $n;
-            }
+            if ($n !== null && $n >= 0 && $n <= 25) $ages[] = $n;
         }
 
         return array_values(array_unique($ages));
     }
 
-    private function parseMoneyInt(?string $s): ?int
+    private function normalizePartyGroups($v): array
     {
-        if (! is_string($s)) return null;
+        if ($v === null) return [];
 
-        $s = trim($s);
-        if ($s === '') return null;
+        if (is_string($v)) {
+            $decoded = json_decode($v, true);
+            $v = is_array($decoded) ? $decoded : [];
+        }
 
-        $s = preg_replace('/[^\d\.\,\s]/u', '', $s);
+        if (! is_array($v)) return [];
 
-        if (str_contains($s, ',') && str_contains($s, '.')) {
-            $s = str_replace('.', '', $s);
-            $s = str_replace(',', '.', $s);
-        } else {
-            if (str_contains($s, ',')) $s = str_replace(',', '.', $s);
-            $s = str_replace(' ', '', $s);
-            if (preg_match('/\.\d{3}(\D|$)/', $s)) {
-                $s = str_replace('.', '', $s);
+        $out = [];
+        foreach ($v as $g) {
+            if (! is_array($g)) continue;
+
+            $adults   = $this->normalizeInt($g['adults'] ?? null);
+            $children = $this->normalizeInt($g['children'] ?? null);
+
+            $ages = $this->normalizeAgesToArray($g['children_ages'] ?? ($g['ages'] ?? null));
+
+            $req = $g['requirements'] ?? [];
+            if (is_string($req)) {
+                $req = preg_split('/[,;\n]+/u', $req) ?: [];
             }
-        }
 
-        $n = (float) $s;
-        if ($n <= 0) return null;
-
-        return (int) round($n);
-    }
-
-    /**
-     * Fallback parser (heuristic) — radi i bez AI.
-     */
-    private function fallbackExtract(Inquiry $inquiry): array
-    {
-        $text = trim((string) ($inquiry->raw_message ?? ''));
-        $t = mb_strtolower($text);
-
-        [$location, $region] = $this->extractLocationRegionFallback($t);
-
-        $adults = $this->extractAdultsFromText($text);
-        $childrenCount = $this->extractChildrenCountFromText($text);
-        $childrenAges = $this->extractChildrenAgesFromText($text);
-
-        [$dateFrom, $dateTo] = $this->extractDateRangeFromText($text);
-        $monthHint = $this->extractMonthHint($text);
-
-        $nights = null;
-        if ($dateFrom && $dateTo) {
-            try {
-                $n = Carbon::parse($dateFrom)->diffInDays(Carbon::parse($dateTo));
-                $nights = $n > 0 ? $n : null;
-            } catch (\Throwable) {
-                // ignore
+            $reqOut = [];
+            if (is_array($req)) {
+                foreach ($req as $r) {
+                    if (! is_string($r)) continue;
+                    $r = trim($r);
+                    if ($r !== '') $reqOut[] = $r;
+                }
             }
-        } else {
-            $nights = $this->extractNightsFromText($text);
+            $reqOut = array_values(array_unique($reqOut));
+
+            $out[] = [
+                'adults' => $adults,
+                'children' => $children,
+                'children_ages' => $ages,
+                'requirements' => $reqOut,
+            ];
         }
 
-        // deterministic: ako imamo date_from + nights, a nemamo date_to
-        if ($dateFrom && $nights && ! $dateTo) {
-            try {
-                $dateTo = Carbon::parse($dateFrom)->addDays((int) $nights)->toDateString();
-            } catch (\Throwable) {
-                // ignore
-            }
-        }
-
-        // ✅ shift na budućnost ako je upit primljen kasnije (ili now)
-        [$dateFrom, $dateTo] = $this->normalizeFutureDates(
-            $dateFrom,
-            $dateTo,
-            $nights,
-            $inquiry->received_at ? Carbon::parse($inquiry->received_at) : null
-        );
-
-        $budget = $this->extractBudgetFromText($text);
-        $wants = $this->extractWantsFromText($text);
-        $special = $this->extractSpecialRequirementsText($text);
-
-        // ako imamo tačne datume, month_hint čistimo
-        if ($dateFrom && $dateTo) {
-            $monthHint = null;
-        }
-
-        return [
-            'region' => $region,
-            'location' => $location,
-            'month_hint' => $monthHint,
-
-            'date_from' => $dateFrom,
-            'date_to' => $dateTo,
-            'nights' => $nights,
-
-            'adults' => $adults,
-            'children' => $childrenCount,
-            'children_ages' => $childrenAges ?: [],
-
-            'budget_min' => $budget['budget_min'],
-            'budget_max' => $budget['budget_max'],
-
-            'wants_near_beach' => $wants['wants_near_beach'],
-            'wants_parking' => $wants['wants_parking'],
-            'wants_quiet' => $wants['wants_quiet'],
-            'wants_pets' => $wants['wants_pets'],
-            'wants_pool' => $wants['wants_pool'],
-
-            'special_requirements' => $special,
-            'language' => $this->guessLanguage($text),
-
-            '_mode' => 'fallback',
-        ];
+        return array_values(array_filter($out, function ($g) {
+            return !(
+                ($g['adults'] === null) &&
+                ($g['children'] === null) &&
+                empty($g['children_ages']) &&
+                empty($g['requirements'])
+            );
+        }));
     }
 
-    // ------------------------------
-    // Helper metode (tvoj postojeći kod)
-    // ------------------------------
-
-    private function extractLocationRegionFallback(string $t): array
+    private function derivePartyTotalsFromGroups(array $groups): array
     {
-        $map = [
-            'pefkohori' => ['Pefkohori', 'Halkidiki - Kassandra'],
-            'paliouri' => ['Paliouri', 'Halkidiki - Kassandra'],
-            'hanioti' => ['Hanioti', 'Halkidiki - Kassandra'],
-            'polihrono' => ['Polichrono', 'Halkidiki - Kassandra'],
-            'polichrono' => ['Polichrono', 'Halkidiki - Kassandra'],
-            'kriopigi' => ['Kriopigi', 'Halkidiki - Kassandra'],
-
-            'stavros' => ['Stavros', 'Thessaloniki region'],
-            'asprovalta' => ['Asprovalta', 'Thessaloniki region'],
-            'nea vrasna' => ['Nea Vrasna', 'Thessaloniki region'],
-            'vrasna' => ['Vrasna', 'Thessaloniki region'],
-
-            'sarti' => ['Sarti', 'Halkidiki - Sithonia'],
-            'nikiti' => ['Nikiti', 'Halkidiki - Sithonia'],
-            'toroni' => ['Toroni', 'Halkidiki - Sithonia'],
-            'vourvourou' => ['Vourvourou', 'Halkidiki - Sithonia'],
-            // dodaj po potrebi
-            'jerisos' => ['Jerisos', 'Halkidiki - Athos'],
-        ];
-
-        foreach ($map as $needle => $lr) {
-            if (Str::contains($t, $needle)) {
-                return [$lr[0], $lr[1]];
-            }
-        }
-
-        if (Str::contains($t, 'kassandra')) return [null, 'Halkidiki - Kassandra'];
-        if (Str::contains($t, 'sithonia')) return [null, 'Halkidiki - Sithonia'];
-        if (Str::contains($t, 'halkidiki')) return [null, 'Halkidiki'];
-
-        return [null, null];
-    }
-
-    private function extractAdultsFromText(string $text): ?int
-    {
-        $t = mb_strtolower($text);
-
-        if (preg_match('/(\d+)\s*odrasl\w*/u', $t, $m)) {
-            return (int) $m[1];
-        }
-
-        if (preg_match('/za\s*(\d+)\s*osob/u', $t, $m)) {
-            return (int) $m[1];
-        }
-
-        return null;
-    }
-
-    private function extractChildrenCountFromText(string $text): ?int
-    {
-        $t = mb_strtolower($text);
-
-        if (preg_match('/(\d+)\s*(dece|det[ea]|children)/u', $t, $m)) {
-            return (int) $m[1];
-        }
-
-        return null;
-    }
-
-    private function extractChildrenAgesFromText(string $text): array
-    {
-        $t = mb_strtolower($text);
+        $adults = 0;
+        $children = 0;
         $ages = [];
 
-        if (preg_match_all('/det[ea]\s*\(?\s*(\d{1,2})\s*(god|g)\w*\)?/u', $t, $mm, PREG_SET_ORDER)) {
-            foreach ($mm as $m) {
-                $ages[] = (int) $m[1];
-            }
-        }
+        $hasAdults = false;
+        $hasChildren = false;
 
-        if (preg_match_all('/\b(\d{1,2})\s*(god|g)\b/u', $t, $mm, PREG_SET_ORDER)) {
-            foreach ($mm as $m) {
-                $n = (int) $m[1];
-                if ($n >= 0 && $n <= 25) {
-                    $ages[] = $n;
+        foreach ($groups as $g) {
+            if (! is_array($g)) continue;
+
+            if (array_key_exists('adults', $g) && $g['adults'] !== null) {
+                $hasAdults = true;
+                $adults += (int) $g['adults'];
+            }
+
+            if (array_key_exists('children', $g) && $g['children'] !== null) {
+                $hasChildren = true;
+                $children += (int) $g['children'];
+            }
+
+            $a = $g['children_ages'] ?? [];
+            if (is_array($a)) {
+                foreach ($a as $age) {
+                    $n = $this->normalizeInt($age);
+                    if ($n !== null && $n >= 0 && $n <= 25) $ages[] = $n;
                 }
             }
         }
 
-        return array_values(array_unique($ages));
-    }
-
-    private function extractDateRangeFromText(string $text): array
-    {
-        $t = mb_strtolower($text);
-
-        if (preg_match('/\b(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\b/u', $t, $m)) {
-            $from = Carbon::createFromDate((int)$m[3], (int)$m[2], (int)$m[1])->startOfDay();
-            $to   = Carbon::createFromDate((int)$m[6], (int)$m[5], (int)$m[4])->startOfDay();
-            return [$from->toDateString(), $to->toDateString()];
-        }
-
-        if (preg_match('/\b(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*[.\-\/]\s*(\d{4})\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\b/u', $t, $m)) {
-            $y = (int)$m[3];
-            $from = Carbon::createFromDate($y, (int)$m[2], (int)$m[1])->startOfDay();
-            $to   = Carbon::createFromDate($y, (int)$m[5], (int)$m[4])->startOfDay();
-            return [$from->toDateString(), $to->toDateString()];
-        }
-
-        if (preg_match('/\b(?:od\s*)?(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*\.?\s*(?:do|\-)\s*(\d{1,2})\s*[.\-\/]\s*(\d{1,2})\s*\.?\b/u', $t, $m)) {
-            $d1 = (int)$m[1]; $mo1 = (int)$m[2];
-            $d2 = (int)$m[3]; $mo2 = (int)$m[4];
-
-            $from = $this->inferFutureDate($d1, $mo1);
-            $to   = $this->inferFutureDate($d2, $mo2);
-
-            if ($to->lte($from)) {
-                $to = $to->copy()->addYear();
-            }
-
-            return [$from->toDateString(), $to->toDateString()];
-        }
-
-        return [null, null];
-    }
-
-    private function inferFutureDate(int $day, int $month): Carbon
-    {
-        $today = now()->startOfDay();
-
-        $month = max(1, min(12, $month));
-        $day   = max(1, min(31, $day));
-
-        $candidate = Carbon::create($today->year, $month, 1)->startOfDay();
-        $maxDay = $candidate->daysInMonth;
-        $day = min($day, $maxDay);
-
-        $candidate = Carbon::create($today->year, $month, $day)->startOfDay();
-
-        if ($candidate->lt($today)) {
-            $candidate = $candidate->addYear();
-        }
-
-        return $candidate;
-    }
-
-    private function extractMonthHint(string $text): ?string
-    {
-        $t = mb_strtolower($text);
-
-        if (preg_match('/\b(sredina|po[cč]etak|kraj|druga polovina|prva polovina)\s+(januara|februara|marta|aprila|maja|juna|jula|avgusta|septembra|oktobra|novembra|decembra|jan|feb|mar|apr|maj|jun|jul|avg|sep|okt|nov|dec)\b/u', $t, $m)) {
-            return trim($m[0]);
-        }
-
-        if (preg_match('/\b(u|tokom|krajem|po[cč]etkom)\s+(januaru|februaru|martu|aprilu|maju|junu|julu|avgustu|septembru|oktobru|novembru|decembru)\b/u', $t, $m)) {
-            return trim($m[0]);
-        }
-
-        if (preg_match('/\b(druga polovina|prva polovina|po[cč]etak|sredina|kraj)\s+\w+\s+ili\s+(druga polovina|prva polovina|po[cč]etak|sredina|kraj)\s+\w+\b/u', $t, $m)) {
-            return trim($m[0]);
-        }
-
-        return null;
-    }
-
-    private function extractNightsFromText(string $text): ?int
-    {
-        $t = mb_strtolower($text);
-
-        if (preg_match('/\b(\d{1,2})\s*(noc|noci|noćenj|nocenja|night)\w*\b/u', $t, $m)) {
-            return (int) $m[1];
-        }
-
-        if (preg_match('/\b(\d{1,2})\s*-\s*(\d{1,2})\s*(noc|noci|noćenj|nocenja)\b/u', $t, $m)) {
-            return (int) $m[2];
-        }
-
-        return null;
-    }
-
-    private function extractBudgetFromText(string $text): array
-    {
-        $t = mb_strtolower($text);
-
-        $hasBudgetContext = Str::contains($t, ['€', 'eur', 'eura', 'euro', 'budžet', 'budzet', 'budget']);
-        if (! $hasBudgetContext) {
-            return ['budget_min' => null, 'budget_max' => null];
-        }
-
-        if (preg_match('/\b(?:budžet|budzet|budget)?\s*(?:od)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\s*(?:do|\-)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
-            return [
-                'budget_min' => $this->parseMoneyInt($m[1]),
-                'budget_max' => $this->parseMoneyInt($m[2]),
-            ];
-        }
-
-        if (preg_match('/\b(?:budžet|budzet|budget)[^0-9]{0,40}od\s*([\d\.\,\s]{1,12})\s*(?:do|\-)\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
-            return [
-                'budget_min' => $this->parseMoneyInt($m[1]),
-                'budget_max' => $this->parseMoneyInt($m[2]),
-            ];
-        }
-
-        if (preg_match('/\b(?:budžet|budzet|budget)?[^0-9]{0,40}\bdo\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
-            return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
-        }
-
-        if (preg_match('/\b(?:budžet|budzet|budget)?[^0-9]{0,40}\boko\s*([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
-            return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
-        }
-
-        if (Str::contains($t, ['budžet', 'budzet', 'budget']) && preg_match('/\b([\d\.\,\s]{1,12})\s*(?:eur|eura|euro|€)\b/u', $t, $m)) {
-            return ['budget_min' => null, 'budget_max' => $this->parseMoneyInt($m[1])];
-        }
-
-        return ['budget_min' => null, 'budget_max' => null];
-    }
-
-    private function extractWantsFromText(string $text): array
-    {
-        $t = mb_strtolower($text);
-
-        $nearBeach =
-            Str::contains($t, 'blizu pla') ||
-            Str::contains($t, 'blizu plaz') ||
-            Str::contains($t, 'do pla') ||
-            (Str::contains($t, 'bli') && Str::contains($t, 'plaž'));
-
-        $parking = Str::contains($t, 'parking');
-        $quiet   = (Str::contains($t, 'mirno') || Str::contains($t, 'mirna') || Str::contains($t, 'tiho'));
-        $pets    = (Str::contains($t, 'ljubim') || Str::contains($t, 'pet') || Str::contains($t, 'pas') || Str::contains($t, 'mack'));
-        $pool    = (Str::contains($t, 'bazen') || Str::contains($t, 'pool'));
+        $ages = array_values(array_unique($ages));
 
         return [
-            'wants_near_beach' => $nearBeach ? true : null,
-            'wants_parking' => $parking ? true : null,
-            'wants_quiet' => $quiet ? true : null,
-            'wants_pets' => $pets ? true : null,
-            'wants_pool' => $pool ? true : null,
+            $hasAdults ? $adults : null,
+            $hasChildren ? $children : null,
+            $ages,
         ];
     }
 
-    private function extractSpecialRequirementsText(string $text): ?string
+    private function normalizeFutureDates(?string $dateFrom, ?string $dateTo, ?int $nights, ?Carbon $receivedAt = null): array
     {
-        $t = mb_strtolower($text);
+        if (! $dateFrom) return [$dateFrom, $dateTo];
 
-        $parts = [];
+        try {
+            $from = Carbon::parse($dateFrom)->startOfDay();
+        } catch (\Throwable) {
+            return [null, null];
+        }
 
-        if (Str::contains($t, ['mirno', 'mirna', 'tiho'])) $parts[] = 'Mirna lokacija';
-        if (Str::contains($t, ['blizu pla', 'blizu plaz', 'do pla'])) $parts[] = 'Blizu plaže';
-        if (Str::contains($t, 'parking')) $parts[] = 'Parking';
-        if (Str::contains($t, ['ljubim', 'pas', 'mack'])) $parts[] = 'Kućni ljubimci';
-        if (Str::contains($t, ['bazen', 'pool'])) $parts[] = 'Bazen';
+        $to = null;
+        if ($dateTo) {
+            try {
+                $to = Carbon::parse($dateTo)->startOfDay();
+            } catch (\Throwable) {
+                $to = null;
+            }
+        }
 
-        $parts = array_values(array_unique($parts));
+        $ref = ($receivedAt ?: now())->startOfDay();
 
-        return empty($parts) ? null : implode(', ', $parts);
+        if ($from->lt($ref->copy()->subDays(7))) {
+            $from->addYear();
+            if ($to) {
+                $to->addYear();
+            } elseif ($nights) {
+                $to = $from->copy()->addDays((int) $nights);
+            }
+        }
+
+        return [$from->toDateString(), $to?->toDateString()];
     }
 
     private function guessLanguage(string $text): string
@@ -752,5 +903,98 @@ USR;
         $t = mb_strtolower($text);
         if (Str::contains($t, ['hello', 'hi', 'please', 'regards'])) return 'en';
         return 'sr';
+    }
+
+    // ------------------------------
+    // FallbackExtract
+    // ------------------------------
+    private function fallbackExtract(Inquiry $inquiry): array
+    {
+        $unit = [
+            'unit_index' => 1,
+            'party_group' => [
+                'adults' => $inquiry->adults,
+                'children' => $inquiry->children,
+                'children_ages' => $inquiry->children_ages ?? [],
+                'requirements' => [],
+            ],
+            'property_candidates' => [],
+            'wishes_override' => null,
+        ];
+
+        return [
+            'intent' => 'standard_search',
+            'out_of_scope_reason' => null,
+
+            'entities' => [
+                'property_candidates' => [],
+                'location_candidates' => [],
+                'region_candidates'   => [],
+                'date_candidates'     => [],
+            ],
+            'travel_time' => [
+                'date_from' => $inquiry->date_from ? $inquiry->date_from->toDateString() : null,
+                'date_to' => $inquiry->date_to ? $inquiry->date_to->toDateString() : null,
+                'date_window' => null,
+                'nights' => $inquiry->nights,
+            ],
+
+            'property_candidates' => [],
+            'location_candidates' => [],
+            'region_candidates' => [],
+            'date_candidates' => [],
+
+            'party' => [
+                'units_needed' => null,
+                'adults' => $inquiry->adults,
+                'children' => $inquiry->children,
+                'children_ages' => $inquiry->children_ages ?? [],
+                'groups' => [[
+                    'adults' => $inquiry->adults,
+                    'children' => $inquiry->children,
+                    'children_ages' => $inquiry->children_ages ?? [],
+                    'requirements' => [],
+                ]],
+                'confidence' => null,
+            ],
+
+            'units' => [$unit], // ✅
+
+            'wishes' => [
+                'near_beach' => null,
+                'parking' => null,
+                'quiet' => null,
+                'pets' => null,
+                'pool' => null,
+                'separate_bedroom' => null,
+            ],
+            'questions' => [],
+            'tags' => [],
+            'why_no_offer' => [],
+
+            'budget_min' => $inquiry->budget_min,
+            'budget_max' => $inquiry->budget_max,
+            'language' => $this->guessLanguage((string) $inquiry->raw_message),
+
+            // legacy:
+            'region' => $inquiry->region,
+            'location' => $inquiry->location,
+            'month_hint' => $inquiry->month_hint,
+            'date_from' => $inquiry->date_from ? $inquiry->date_from->toDateString() : null,
+            'date_to' => $inquiry->date_to ? $inquiry->date_to->toDateString() : null,
+            'nights' => $inquiry->nights,
+            'adults' => $inquiry->adults,
+            'children' => $inquiry->children,
+            'children_ages' => $inquiry->children_ages ?? [],
+            'wants_near_beach' => $inquiry->wants_near_beach,
+            'wants_parking' => $inquiry->wants_parking,
+            'wants_quiet' => $inquiry->wants_quiet,
+            'wants_pets' => $inquiry->wants_pets,
+            'wants_pool' => $inquiry->wants_pool,
+            'special_requirements' => $inquiry->special_requirements,
+
+            '_mode' => 'fallback',
+            '_warnings' => [],
+        ];
     }
 }

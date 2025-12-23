@@ -117,8 +117,8 @@ class AiSuggestInquiries extends Command
                     // ✅ SOURCE OF TRUTH: matcher radi primary + alternatives + log
                     $out = $matcher->matchWithAlternatives($inquiry, 5, 5);
 
-                    $primary = ($out['primary'] ?? collect())->values()->all();
-                    $alts    = ($out['alternatives'] ?? collect())->values()->all();
+                    $primary = collect($out['primary'] ?? [])->values()->all();
+                    $alts    = collect($out['alternatives'] ?? [])->values()->all();
                     $log     = $out['log'] ?? [];
 
                     $ai->suggestions_payload = [
@@ -138,7 +138,6 @@ class AiSuggestInquiries extends Command
                         $ai->status = 'suggested';
                         $ai->missing_fields = null;
                     } else {
-                        // nema ni primary ni alternative -> no_availability
                         if ($inquiry->status === 'new') {
                             $inquiry->status = 'extracted';
                             $inquiry->processed_at = Carbon::now();

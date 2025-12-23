@@ -2,21 +2,22 @@
 
 namespace App\Models;
 
-use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Model;
 
 class AiInquiry extends Model
 {
     protected $table = 'ai_inquiries';
 
-    // Pipeline statusi (string u DB, ali držimo konstante zbog konzistentnosti)
-    public const STATUS_NEW            = 'new';
-    public const STATUS_SYNCED         = 'synced';
-    public const STATUS_PARSED         = 'parsed';
-    public const STATUS_NEEDS_INFO     = 'needs_info';
-    public const STATUS_SUGGESTED      = 'suggested';
-    public const STATUS_NO_AVAIL       = 'no_availability';
-    public const STATUS_ERROR          = 'error';
+    // Pipeline statusi
+    public const STATUS_NEW        = 'new';
+    public const STATUS_SYNCED     = 'synced';
+    public const STATUS_PARSED     = 'parsed';
+    public const STATUS_NEEDS_INFO = 'needs_info';
+    public const STATUS_SUGGESTED  = 'suggested';
+    public const STATUS_NO_AVAIL   = 'no_availability';
+    public const STATUS_NO_AI      = 'no_ai';
+    public const STATUS_ERROR      = 'error';
 
     protected $fillable = [
         'source',
@@ -33,6 +34,12 @@ class AiInquiry extends Model
         'status',
         'ai_stopped',
 
+        // intent + audit
+        'intent',
+        'out_of_scope_reason',
+        'parsed_payload',
+        'parse_warnings',
+
         'inquiry_id',
 
         'parsed_at',
@@ -46,16 +53,32 @@ class AiInquiry extends Model
         'headers'             => 'array',
         'received_at'         => 'datetime',
         'ai_stopped'          => 'boolean',
+
+        'intent'              => 'string',
+        'parsed_payload'      => 'array',
+        'parse_warnings'      => 'array',
+
         'missing_fields'      => 'array',
         'suggestions_payload' => 'array',
         'parsed_at'           => 'datetime',
         'suggested_at'        => 'datetime',
     ];
 
+    /**
+     * VAŽNO:
+     * - Ne stavljamo JSON string default-e ('{}', '[]') na kolone koje su cast-ovane u array.
+     * - To ume da napravi "Array to string conversion" i Filament probleme.
+     * - Default neka bude null, a u UI/servisima koristimo ?? [] / ?? {} fallback.
+     */
     protected $attributes = [
         'ai_stopped' => false,
         'status'     => self::STATUS_NEW,
         'source'     => 'local',
+
+        'parsed_payload'      => null,
+        'parse_warnings'      => null,
+        'missing_fields'      => null,
+        'suggestions_payload' => null,
     ];
 
     public function inquiry()
@@ -94,10 +117,12 @@ class AiInquiry extends Model
 
     public function hasSuggestions(): bool
     {
-        return ! empty($this->suggestions_payload)
+        $payload = $this->suggestions_payload ?? [];
+
+        return ! empty($payload)
             && (
-                ! empty($this->suggestions_payload['primary'])
-                || ! empty($this->suggestions_payload['alternatives'])
+                ! empty($payload['primary'])
+                || ! empty($payload['alternatives'])
             );
     }
 

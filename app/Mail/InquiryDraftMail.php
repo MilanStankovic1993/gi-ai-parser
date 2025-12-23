@@ -5,6 +5,7 @@ namespace App\Mail;
 use App\Models\Inquiry;
 use Illuminate\Bus\Queueable;
 use Illuminate\Mail\Mailable;
+use Illuminate\Mail\Mailables\Address;
 use Illuminate\Mail\Mailables\Content;
 use Illuminate\Mail\Mailables\Envelope;
 use Illuminate\Mail\Mailables\Headers;
@@ -24,32 +25,16 @@ class InquiryDraftMail extends Mailable
     {
         $subject = $this->inquiry->subject ?: 'Upit';
 
-        // Ako već nije "Re:", dodaj "Re:"
-        if (!preg_match('/^\s*re:/i', $subject)) {
+        if (! preg_match('/^\s*re:/i', $subject)) {
             $subject = 'Re: ' . $subject;
         }
 
-        $envelope = new Envelope(
-            subject: $subject,
-        );
+        $envelope = new Envelope(subject: $subject);
 
-        // From ćemo setovati kasnije (kad dobijemo kredencijale),
-        // ali omogućavamo da se prosledi ovde.
         if ($this->fromAddress) {
-            $envelope->from = new \Illuminate\Mail\Mailables\Address(
-                $this->fromAddress,
-                $this->fromName ?: config('app.name')
-            );
-        }
-
-        // Reply-To (da odgovor ide na pravi inbox)
-        if ($this->fromAddress) {
-            $envelope->replyTo = [
-                new \Illuminate\Mail\Mailables\Address(
-                    $this->fromAddress,
-                    $this->fromName ?: config('app.name')
-                ),
-            ];
+            $addr = new Address($this->fromAddress, $this->fromName ?: config('app.name'));
+            $envelope->from = $addr;
+            $envelope->replyTo = [$addr];
         }
 
         return $envelope;
@@ -57,24 +42,18 @@ class InquiryDraftMail extends Mailable
 
     public function content(): Content
     {
-        // U Fazi 1 šaljemo plain text (najsigurnije za deliverability).
-        // Body je AI draft koji agent može izmeniti pre slanja.
-        $body = $this->inquiry->ai_draft ?: '';
-
         return new Content(
             text: 'emails.inquiry-draft',
             with: [
-                'body' => $body,
+                'body' => $this->inquiry->ai_draft ?: '',
             ]
         );
     }
 
     public function headers(): Headers
     {
-        $messageId = $this->normalizeMessageId($this->inquiry->external_id);
+        $messageId = $this->getOriginalMessageId();
 
-        // Ako imamo message-id originalnog mejla, šaljemo reply header-e
-        // (ovo je 1:1 za “reply na upit” ponašanje)
         if ($messageId) {
             return new Headers(
                 text: [
@@ -87,21 +66,44 @@ class InquiryDraftMail extends Mailable
         return new Headers();
     }
 
+    private function getOriginalMessageId(): ?string
+    {
+        // 1) Prefer ai_inquiries.message_id (to je pravi Message-ID originalnog mejla)
+        $ai = $this->inquiry->relationLoaded('aiInquiry')
+            ? $this->inquiry->aiInquiry
+            : $this->inquiry->aiInquiry()->first();
+
+        $mid = $ai?->message_id;
+        $mid = $this->normalizeMessageId($mid);
+        if ($mid) return $mid;
+
+        // 2) Fallback: pokušaj da izvučeš <...> iz external_id ako ga tamo nosiš
+        $ex = (string) ($this->inquiry->external_id ?? '');
+        if ($ex !== '') {
+            if (preg_match('/<[^>]+>/', $ex, $m)) {
+                return $this->normalizeMessageId($m[0]);
+            }
+        }
+
+        return null;
+    }
+
     private function normalizeMessageId(?string $raw): ?string
     {
         $raw = trim((string) $raw);
-        if ($raw === '') {
+        if ($raw === '') return null;
+
+        // ako već ima <...>, izvuci ga i vrati samo to
+        if (preg_match('/<[^>]+>/', $raw, $m)) {
+            return $m[0];
+        }
+
+        // ako je "gola" vrednost (bez uglastih zagrada), uokviri
+        // (minimalna validacija: ne sme imati razmake)
+        if (str_contains($raw, ' ')) {
             return null;
         }
 
-        // U bazi može biti sa ili bez < >
-        if (!str_starts_with($raw, '<')) {
-            $raw = '<' . $raw;
-        }
-        if (!str_ends_with($raw, '>')) {
-            $raw = $raw . '>';
-        }
-
-        return $raw;
+        return '<' . $raw . '>';
     }
 }

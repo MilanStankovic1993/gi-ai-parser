@@ -8,13 +8,12 @@ use Filament\Forms\Form;
 use Filament\Resources\Resource;
 use Filament\Tables;
 use Filament\Tables\Table;
-use Illuminate\Support\Arr;
 
 class InquiryResource extends Resource
 {
     protected static ?string $model = Inquiry::class;
 
-    protected static ?string $navigationIcon = 'heroicon-o-inbox';
+    protected static ?string $navigationIcon  = 'heroicon-o-inbox';
     protected static ?string $navigationLabel = 'Inquiries';
     protected static ?string $navigationGroup = 'AI Inquiries';
 
@@ -23,33 +22,60 @@ class InquiryResource extends Resource
         return $form->schema([
             \Filament\Forms\Components\Section::make('Guest')
                 ->schema([
-                    \Filament\Forms\Components\TextInput::make('guest_name')->label('Ime gosta')->maxLength(255),
-                    \Filament\Forms\Components\TextInput::make('guest_email')->label('Email')->email()->maxLength(255),
-                    \Filament\Forms\Components\TextInput::make('guest_phone')->label('Telefon')->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('guest_name')
+                        ->label('Ime gosta')
+                        ->maxLength(255),
+
+                    \Filament\Forms\Components\TextInput::make('guest_email')
+                        ->label('Email')
+                        ->email()
+                        ->maxLength(255),
+
+                    \Filament\Forms\Components\TextInput::make('guest_phone')
+                        ->label('Telefon')
+                        ->maxLength(255),
                 ])
                 ->columns(3),
 
             \Filament\Forms\Components\Section::make('Inquiry')
                 ->schema([
-                    \Filament\Forms\Components\TextInput::make('subject')->label('Naslov / subject')->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('subject')
+                        ->label('Naslov / subject')
+                        ->maxLength(255),
 
                     \Filament\Forms\Components\Textarea::make('raw_message')
                         ->label('Originalni upit')
                         ->rows(8)
                         ->required(),
 
-                    \Filament\Forms\Components\TextInput::make('region')->label('Regija')->maxLength(255),
-                    \Filament\Forms\Components\TextInput::make('location')->label('Mesto')->maxLength(255),
-                    \Filament\Forms\Components\TextInput::make('month_hint')->label('Okvirni period')->maxLength(255),
+                    \Filament\Forms\Components\TextInput::make('region')
+                        ->label('Regija')
+                        ->maxLength(255),
 
-                    \Filament\Forms\Components\DatePicker::make('date_from')->label('Datum od'),
-                    \Filament\Forms\Components\DatePicker::make('date_to')->label('Datum do'),
+                    \Filament\Forms\Components\TextInput::make('location')
+                        ->label('Mesto')
+                        ->maxLength(255),
 
-                    \Filament\Forms\Components\TextInput::make('adults')->label('Odrasli')->numeric()->minValue(0),
-                    \Filament\Forms\Components\TextInput::make('children')->label('Deca')->numeric()->minValue(0),
+                    \Filament\Forms\Components\TextInput::make('month_hint')
+                        ->label('Okvirni period')
+                        ->maxLength(255),
 
-                    // children_ages je cast array u modelu => u formi ga prikazujemo kao string,
-                    // i pretvaramo nazad u array pre snimanja.
+                    \Filament\Forms\Components\DatePicker::make('date_from')
+                        ->label('Datum od'),
+
+                    \Filament\Forms\Components\DatePicker::make('date_to')
+                        ->label('Datum do'),
+
+                    \Filament\Forms\Components\TextInput::make('adults')
+                        ->label('Odrasli')
+                        ->numeric()
+                        ->minValue(0),
+
+                    \Filament\Forms\Components\TextInput::make('children')
+                        ->label('Deca')
+                        ->numeric()
+                        ->minValue(0),
+
                     \Filament\Forms\Components\TextInput::make('children_ages')
                         ->label('Uzrast dece (npr: 5 ili 5, 8)')
                         ->maxLength(255)
@@ -80,13 +106,19 @@ class InquiryResource extends Resource
                                     $nums[] = (int) $n;
                                 }
                             }
-                            $nums = array_values(array_unique(array_filter($nums, fn ($n) => $n >= 0 && $n <= 17)));
 
-                            return $nums;
+                            return array_values(array_unique(array_filter($nums, fn ($n) => $n >= 0 && $n <= 17)));
                         }),
 
-                    \Filament\Forms\Components\TextInput::make('budget_min')->label('Budžet min')->numeric()->minValue(0),
-                    \Filament\Forms\Components\TextInput::make('budget_max')->label('Budžet max')->numeric()->minValue(0),
+                    \Filament\Forms\Components\TextInput::make('budget_min')
+                        ->label('Budžet min')
+                        ->numeric()
+                        ->minValue(0),
+
+                    \Filament\Forms\Components\TextInput::make('budget_max')
+                        ->label('Budžet max')
+                        ->numeric()
+                        ->minValue(0),
 
                     \Filament\Forms\Components\DateTimePicker::make('received_at')
                         ->label('Primljeno')
@@ -108,15 +140,17 @@ class InquiryResource extends Resource
                     \Filament\Forms\Components\Select::make('status')
                         ->label('Status upita')
                         ->options([
-                            'new'       => 'New',
-                            'extracted' => 'Extracted',
-                            'suggested' => 'Suggested',
-                            'replied'   => 'Replied',
-                            'closed'    => 'Closed',
+                            'new'        => 'New',
+                            'extracted'  => 'Extracted',
+                            'needs_info' => 'Needs info',
+                            'suggested'  => 'Suggested',
+                            'replied'    => 'Replied',
+                            'closed'     => 'Closed',
                         ])
                         ->default('new'),
 
-                    \Filament\Forms\Components\Toggle::make('is_priority')->label('Prioritetan upit'),
+                    \Filament\Forms\Components\Toggle::make('is_priority')
+                        ->label('Prioritetan upit'),
                 ])
                 ->columns(3),
         ]);
@@ -143,10 +177,9 @@ class InquiryResource extends Resource
                         return $record->guest_name ?: 'N/A';
                     })
                     ->searchable(query: function ($query, string $search) {
-                        // pretraga i po email-u
                         $query->where(function ($q) use ($search) {
                             $q->where('guest_name', 'like', "%{$search}%")
-                              ->orWhere('guest_email', 'like', "%{$search}%");
+                                ->orWhere('guest_email', 'like', "%{$search}%");
                         });
                     }),
 
@@ -156,25 +189,29 @@ class InquiryResource extends Resource
                     ->tooltip(fn (Inquiry $record) => $record->raw_message ?: $record->subject)
                     ->searchable(),
 
-                Tables\Columns\TextColumn::make('region')->label('Regija')->sortable()->toggleable(),
+                Tables\Columns\TextColumn::make('region')
+                    ->label('Regija')
+                    ->sortable()
+                    ->toggleable(),
 
-                // Filament v3: colors() mapa state => color
                 Tables\Columns\BadgeColumn::make('status')
                     ->label('Status')
                     ->colors([
-                        'new'       => 'gray',
-                        'extracted' => 'warning',
-                        'suggested' => 'info',
-                        'replied'   => 'success',
-                        'closed'    => 'danger',
+                        'new'        => 'gray',
+                        'extracted'  => 'warning',
+                        'needs_info' => 'danger',
+                        'suggested'  => 'info',
+                        'replied'    => 'success',
+                        'closed'     => 'secondary',
                     ])
                     ->formatStateUsing(fn ($state) => match ($state) {
-                        'new'       => 'New',
-                        'extracted' => 'Extracted',
-                        'suggested' => 'Suggested',
-                        'replied'   => 'Replied',
-                        'closed'    => 'Closed',
-                        default     => (string) $state,
+                        'new'        => 'New',
+                        'extracted'  => 'Extracted',
+                        'needs_info' => 'Needs info',
+                        'suggested'  => 'Suggested',
+                        'replied'    => 'Replied',
+                        'closed'     => 'Closed',
+                        default      => (string) $state,
                     })
                     ->sortable(),
 
@@ -194,11 +231,12 @@ class InquiryResource extends Resource
                 Tables\Filters\SelectFilter::make('status')
                     ->label('Status')
                     ->options([
-                        'new'       => 'New',
-                        'extracted' => 'Extracted',
-                        'suggested' => 'Suggested',
-                        'replied'   => 'Replied',
-                        'closed'    => 'Closed',
+                        'new'        => 'New',
+                        'extracted'  => 'Extracted',
+                        'needs_info' => 'Needs info',
+                        'suggested'  => 'Suggested',
+                        'replied'    => 'Replied',
+                        'closed'     => 'Closed',
                     ]),
 
                 Tables\Filters\Filter::make('recent')
@@ -214,8 +252,37 @@ class InquiryResource extends Resource
             ])
             ->actions([
                 Tables\Actions\ViewAction::make()->label('Open')->icon('heroicon-o-eye'),
-            ])
 
+                // ✅ Quick edit modal koji UVEK povuče fresh podatke + children_ages kao string
+                Tables\Actions\EditAction::make()
+                    ->label('Quick edit')
+                    ->icon('heroicon-o-pencil-square')
+                    ->fillForm(function (Inquiry $record) {
+                        $r = $record->fresh();
+
+                        $arr = $r->toArray();
+                        $arr['children_ages'] = is_array($r->children_ages)
+                            ? implode(', ', $r->children_ages)
+                            : (is_string($r->children_ages) ? $r->children_ages : '');
+
+                        return $arr;
+                    })
+                    ->mutateFormDataUsing(function (array $data) {
+                        // safety: children_ages nekad dođe kao string iz modala
+                        if (isset($data['children_ages']) && is_string($data['children_ages'])) {
+                            $txt = trim($data['children_ages']);
+                            $parts = $txt === '' ? [] : (preg_split('/[,\s;]+/', $txt) ?: []);
+                            $nums = [];
+                            foreach ($parts as $p) {
+                                $n = preg_replace('/\D+/', '', (string) $p);
+                                if ($n !== '') $nums[] = (int) $n;
+                            }
+                            $data['children_ages'] = array_values(array_unique(array_filter($nums, fn ($n) => $n >= 0 && $n <= 17)));
+                        }
+
+                        return $data;
+                    }),
+            ])
             ->bulkActions([
                 Tables\Actions\BulkActionGroup::make([]),
             ]);
@@ -226,6 +293,7 @@ class InquiryResource extends Resource
         return [
             'index' => Pages\ListInquiries::route('/'),
             'view'  => Pages\ViewInquiry::route('/{record}'),
+            'edit'  => Pages\EditInquiry::route('/{record}/edit'),
         ];
     }
 }

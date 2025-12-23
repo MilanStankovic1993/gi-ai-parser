@@ -88,7 +88,6 @@ class GiImapPullInquiries extends Command
         $query = $folder->query();
 
         if ($mode === 'all') {
-            // Gmail/Webklex: mora eksplicitno all()
             $query->all();
         } else {
             $query->unseen();
@@ -144,9 +143,10 @@ class GiImapPullInquiries extends Command
 
             // ----- headers
             $headersObj = $message->getHeader();
-            $messageId  = (string) (($headersObj->get('message-id')[0] ?? '') ?: '');
-            $inReplyTo  = (string) (($headersObj->get('in-reply-to')[0] ?? '') ?: '');
-            $references = (string) (($headersObj->get('references')[0] ?? '') ?: '');
+            $messageId  = $this->normalizeHeaderMessageId((string) (($headersObj->get('message-id')[0] ?? '') ?: ''));
+            $inReplyTo  = $this->normalizeHeaderMessageId((string) (($headersObj->get('in-reply-to')[0] ?? '') ?: ''));
+            $references = trim((string) (($headersObj->get('references')[0] ?? '') ?: ''));
+            $references = Str::of($references)->limit(2000)->toString();
 
             // ----- body
             $body = (string) ($message->getTextBody() ?: $message->getHTMLBody() ?: '');
@@ -155,16 +155,21 @@ class GiImapPullInquiries extends Command
             $bodySquished = Str::of($body)->squish()->toString();
             $bodyNorm = mb_strtolower($bodySquished);
 
-            // --- message_hash (dedupe stabilno)
-            $messageHash = hash('sha256', implode('|', [
-                'imap',
-                $inboxKey,
-                $messageId ?: '',
-                $fromLower,
-                $subjectNorm,
-                (string) $receivedAt->toIso8601String(),
-                Str::of($bodySquished)->limit(5000),
-            ]));
+            /**
+             * --- message_hash (dedupe stabilno)
+             * 1) Ako imamo Message-ID -> to je najbolji key
+             * 2) Fallback: from + subject + početak body-ja (bez received_at jer zna da varira)
+             */
+            $hashKey = $messageId !== ''
+                ? implode('|', ['imap', $inboxKey, 'mid', $messageId])
+                : implode('|', [
+                    'imap', $inboxKey, 'fallback',
+                    $fromLower,
+                    $subjectNorm,
+                    Str::of($bodySquished)->limit(2000)->toString(),
+                ]);
+
+            $messageHash = hash('sha256', $hashKey);
 
             // default: new
             $finalStatus = 'new';
@@ -178,9 +183,9 @@ class GiImapPullInquiries extends Command
 
             // 1) follow-up / replies
             if ($finalStatus === 'new' && (
-                ! empty($inReplyTo) ||
-                ! empty($references) ||
-                preg_match('/^(re:|fw:|fwd:)\s*/i', $subjectNorm)
+                $inReplyTo !== '' ||
+                $references !== '' ||
+                preg_match('/^(re(\[\d+\])?:|fw:|fwd:|aw:)\s*/i', $subjectNorm)
             )) {
                 $finalStatus = 'skipped';
                 $skipReason = 'follow_up';
@@ -226,7 +231,6 @@ class GiImapPullInquiries extends Command
                 'inquiry_id'  => null, // popunjava ai:sync-inquiries
             ];
 
-            // updateOrCreate ne kaže da li je created; uradimo ručno:
             $existing = AiInquiry::query()->where('message_hash', $messageHash)->first();
 
             if ($existing) {
@@ -234,12 +238,19 @@ class GiImapPullInquiries extends Command
                 $countUpdated++;
             } else {
                 AiInquiry::create(array_merge(['message_hash' => $messageHash], $payload));
-                if ($finalStatus === 'new') $countNew++; else $countSkipped++;
+                if ($finalStatus === 'new') {
+                    $countNew++;
+                } else {
+                    $countSkipped++;
+                }
             }
 
-            // Seen flag: samo u unseen modu (u ALL modu ne diramo inbox)
-            if ($mode !== 'all') {
-                try { $message->setFlag('Seen'); } catch (\Throwable) {}
+            // Seen flag: samo u unseen modu i samo za NEW (da ne "pojede" skipped)
+            if ($mode !== 'all' && $finalStatus === 'new') {
+                try {
+                    $message->setFlag('Seen');
+                } catch (\Throwable) {
+                }
             }
 
             if ($finalStatus !== 'new') {
@@ -257,6 +268,26 @@ class GiImapPullInquiries extends Command
         }
 
         $this->info("Imported into ai_inquiries: new={$countNew}, updated={$countUpdated}, skipped={$countSkipped} (mode={$mode})");
+    }
+
+    private function normalizeHeaderMessageId(string $raw): string
+    {
+        $raw = trim($raw);
+        if ($raw === '') {
+            return '';
+        }
+
+        // izvuci prvi <...> ako postoji (nekad dođe listom ili sa dodatnim tekstom)
+        if (preg_match('/<[^>]+>/', $raw, $m)) {
+            return $m[0];
+        }
+
+        // ako je "gola" vrednost bez razmaka, uokviri
+        if (!str_contains($raw, ' ') && !str_contains($raw, "\t")) {
+            return '<' . $raw . '>';
+        }
+
+        return $raw;
     }
 
     private function normalizeSubject(string $subjectTrim): string
@@ -315,7 +346,7 @@ class GiImapPullInquiries extends Command
             'confirm your',
             'receipt',
             'order confirmation',
-            'confirmation', // često nisu gosti nego system potvrde
+            'confirmation',
         ];
 
         foreach ($subjectBad as $needle) {
@@ -324,7 +355,6 @@ class GiImapPullInquiries extends Command
             }
         }
 
-        // body signals (tek kad ima više signala)
         $bodyBad = [
             'unsubscribe',
             'view in browser',
