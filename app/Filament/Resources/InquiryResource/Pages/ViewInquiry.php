@@ -651,14 +651,13 @@ class ViewInquiry extends ViewRecord
         $this->record = $record;
 
         // ✅ debug marker (vidi da li se stvarno regeneriše)
-        $marker = 'GENERATED_AT: ' . now()->format('Y-m-d H:i:s');
+        // $marker = 'GENERATED_AT: ' . now()->format('Y-m-d H:i:s');
 
         $intent = (string) ($record->intent ?? 'unknown');
 
         // OUT OF SCOPE → ✅ UVEK overwrite (bez ?:)
         if (in_array($intent, ['owner_request', 'long_stay_private', 'spam'], true)) {
-            $record->ai_draft = $marker . "\n\n" .
-                "Poštovani,\n\nHvala na poruci. Ovaj tip upita trenutno ne obrađujemo automatski (intent: {$intent}).\n\nSrdačan pozdrav,\nGrckaInfo tim";
+            $record->ai_draft = "Poštovani,\n\nHvala na poruci. Ovaj tip upita trenutno ne obrađujemo automatski (intent: {$intent}).\n\nSrdačan pozdrav,\nGrckaInfo tim";
 
             $record->status = Inquiry::STATUS_NO_AI;
             $record->processed_at = now();
@@ -678,7 +677,7 @@ class ViewInquiry extends ViewRecord
         $missing = InquiryMissingData::detect($record);
 
         if (! empty($missing)) {
-            $record->ai_draft = $marker . "\n\n" . view('ai.templates.missing-info', [
+            $record->ai_draft = view('ai.templates.missing-info', [
                 'missing' => $missing,
             ])->render();
 
@@ -742,7 +741,7 @@ class ViewInquiry extends ViewRecord
         };
 
         if ($primary->isEmpty() && $alts->isNotEmpty()) {
-            $record->ai_draft = $marker . "\n\n" . view('ai.templates.no-primary-with-alternatives', [
+            $record->ai_draft = view('ai.templates.no-primary-with-alternatives', [
                 'guest'        => trim((string) ($record->guest_name ?? '')),
                 'alternatives' => $toTemplateItems($alts),
             ])->render();
@@ -763,7 +762,7 @@ class ViewInquiry extends ViewRecord
         }
 
         if ($primary->isEmpty() && $alts->isEmpty()) {
-            $record->ai_draft = $marker . "\n\n" . view('ai.templates.missing-info', [
+            $record->ai_draft = view('ai.templates.missing-info', [
                 'missing' => [
                     'Trenutno nemamo odgovarajuću ponudu u bazi po traženim kriterijumima. Da li ste fleksibilni za drugu lokaciju / datum (±2–3 dana) ili budžet?',
                 ],
@@ -788,7 +787,7 @@ class ViewInquiry extends ViewRecord
         $draft   = $builder->build($record, $primary);
 
         // ✅ marker + overwrite
-        $record->ai_draft = $marker . "\n\n" . $draft;
+        $record->ai_draft = $draft;
         $record->status   = Inquiry::STATUS_SUGGESTED;
         $record->processed_at = now();
         $record->save();

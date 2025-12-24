@@ -5,8 +5,8 @@ Hvala vam na javljanju i interesovanju za letovanje u Grčkoj.
 Na osnovu informacija iz vašeg upita, u nastavku vam šaljemo nekoliko predloga smeštaja koji bi mogli da odgovaraju vašim željama. Ukoliko smo nešto pogrešno razumeli ili želite izmene, slobodno nas ispravite.
 
 @foreach(($suggestions ?? []) as $i => $s)
-{{ $i + 1 }}. {{ $s['name'] ?? 'Smeštaj' }} – {{ $s['place'] ?? '' }}
-• Tip: {{ $s['type'] ?? '-' }} • Kapacitet: {{ $s['capacity'] ?? '-' }} • Cena: {{ $s['price'] ?? '-' }} • Plaža: {{ $s['beach'] ?? '-' }}
+{{ $i + 1 }}. {{ $s['name'] ?? 'Smeštaj' }}@if(!empty($s['place'])) – {{ $s['place'] }}@endif
+• Tip: {{ $s['type'] ?? '-' }} • Kapacitet: {{ $s['capacity'] ?? '-' }} • Cena: {{ $s['price'] ?? '-' }}@if(!empty($s['beach'])) • Plaža: {{ $s['beach'] }}@endif
 • Link: {{ $s['link'] ?? '-' }}
 
 @endforeach

@@ -2,28 +2,26 @@ Poštovani{{ $guest ? ' ' . $guest : '' }},
 
 Hvala vam na javljanju i interesovanju za letovanje u Grčkoj.
 
-Na osnovu kriterijuma iz vašeg upita, trenutno **nemamo dostupne provizijske smeštaje koji u potpunosti odgovaraju traženim uslovima** (period, struktura gostiju, budžet ili lokacija).
+Na osnovu traženih kriterijuma, trenutno nemamo dostupnu ponudu koja u potpunosti odgovara vašem upitu.
 
-Ipak, kako bismo vam pomogli u izboru, u nastavku vam šaljemo **nekoliko alternativnih predloga smeštaja** koji bi mogli biti interesantni:
+Ipak, u nastavku šaljemo 4–5 alternativnih predloga koji bi mogli biti interesantni:
 
-@foreach($alternatives as $idx => $c)
-{{ $idx + 1 }}. {{ $c['title'] ?? 'Smeštaj' }}
-@if(!empty($c['details']))
-• {{ $c['details'] }}
+@foreach(($alternatives ?? []) as $idx => $a)
+{{ $idx + 1 }}. {{ $a['title'] ?? ($a['name'] ?? 'Smeštaj') }}
+@if(!empty($a['price']))
+• Cena: {{ $a['price'] }}
 @endif
-@if(!empty($c['price']))
-• Cena: {{ $c['price'] }}
-@endif
-@if(!empty($c['url']))
-• Link: {{ $c['url'] }}
+@if(!empty($a['url']))
+• Link: {{ $a['url'] }}
 @endif
 
 @endforeach
 
-Ukoliko vam se neki od ovih predloga dopada, ili želite da proverimo **drugu lokaciju, fleksibilnije datume ili drugačiji budžet**, slobodno nam pišite.
+Ukoliko želite, možemo dodatno suziti izbor ako nam potvrdite da li ste fleksibilni u pogledu:
+• druge lokacije u blizini
+• datuma (± 2–3 dana)
+• budžeta / tipa smeštaja
 
-Rado ćemo pokušati da pronađemo najbolje moguće opcije za vas.
-
-Srdačan pozdrav,  
-GrckaInfo tim  
+Srdačan pozdrav,
+GrckaInfo tim
 https://grckainfo.com

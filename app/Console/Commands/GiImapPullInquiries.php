@@ -236,6 +236,10 @@ class GiImapPullInquiries extends Command
             if ($existing) {
                 $existing->fill($payload)->save();
                 $countUpdated++;
+
+                if ($finalStatus !== 'new') {
+                    $countSkipped++; // ✅ da statistika bude tačna
+                }
             } else {
                 AiInquiry::create(array_merge(['message_hash' => $messageHash], $payload));
                 if ($finalStatus === 'new') {
@@ -253,6 +257,23 @@ class GiImapPullInquiries extends Command
                 }
             }
 
+            // ✅ PRIVREMENI LOG: svaka poruka (i new i skipped)
+            Log::info('GiImapPullInquiries: message', [
+                'final'       => $finalStatus,
+                'reason'      => $skipReason,
+                'inbox'       => $inboxKey,
+                'folder'      => $folderName,
+                'mode'        => $mode,
+                'from'        => $fromEmail,
+                'subject'     => $subjectTrim !== '' ? $subjectTrim : null,
+                'message_id'  => $messageId,
+                'in_reply_to' => $inReplyTo,
+                'references'  => $references,
+                'received_at' => $receivedAt->toDateTimeString(),
+                'hash'        => $messageHash,
+            ]);
+
+            // stari skipped log (ostaje)
             if ($finalStatus !== 'new') {
                 Log::info('GiImapPullInquiries: skipped', [
                     'reason' => $skipReason,
@@ -283,7 +304,7 @@ class GiImapPullInquiries extends Command
         }
 
         // ako je "gola" vrednost bez razmaka, uokviri
-        if (!str_contains($raw, ' ') && !str_contains($raw, "\t")) {
+        if (! str_contains($raw, ' ') && ! str_contains($raw, "\t")) {
             return '<' . $raw . '>';
         }
 
