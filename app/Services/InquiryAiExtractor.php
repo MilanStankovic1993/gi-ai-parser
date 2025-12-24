@@ -3,6 +3,7 @@
 namespace App\Services;
 
 use App\Models\Inquiry;
+use App\Services\Ai\AiUsageTracker;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
@@ -32,14 +33,23 @@ class InquiryAiExtractor
             return $this->fallbackExtract($inquiry);
         }
 
+        $tracker = app(AiUsageTracker::class);
+
+        if ($tracker->limitReached()) {
+            // Mesečni limit probijen -> ne zovemo AI, vraćamo fallback
+            return $this->fallbackExtract($inquiry);
+        }
+
         $textForAi = Str::of($text)
             ->replace("\r", "\n")
             ->squish()
             ->limit(9000)
             ->toString();
 
-        $today = $inquiry->received_at
-            ? Carbon::parse($inquiry->received_at)->toDateString()
+        $receivedAt = $inquiry->received_at ? Carbon::parse($inquiry->received_at) : null;
+
+        $today = $receivedAt
+            ? $receivedAt->toDateString()
             : now()->toDateString();
 
         $system = <<<SYS
@@ -80,7 +90,7 @@ OBAVEZNO:
     "confidence": 0..1
   }
 
-✅ KLJUČNO (ODVOJENE PRETRAGE):
+KLJUČNO (ODVOJENE PRETRAGE):
 - units: niz (jedan element = jedna porodica/jedinica/apartman koji tražimo)
   {
     "unit_index": int,  // 1..N
@@ -179,7 +189,25 @@ USR;
                 return $this->fallbackExtract($inquiry);
             }
 
-            $content = data_get($resp->json(), 'choices.0.message.content');
+            $data = $resp->json();
+
+            // Log token usage + cost (ako ga OpenAI vrati) — ne sme da ruši extraction
+            try {
+                $tracker->log(
+                    $model,
+                    'extract',
+                    data_get($data, 'usage'),
+                    null,
+                    $receivedAt ?? now()
+                );
+            } catch (\Throwable $e) {
+                Log::debug('AiUsageTracker log failed', [
+                    'inquiry_id' => $inquiry->id ?? null,
+                    'message' => $e->getMessage(),
+                ]);
+            }
+
+            $content = data_get($data, 'choices.0.message.content');
             if (! is_string($content) || trim($content) === '') {
                 return $this->fallbackExtract($inquiry);
             }

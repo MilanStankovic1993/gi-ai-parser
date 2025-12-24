@@ -3,6 +3,7 @@
 namespace App\Filament\Resources\InquiryResource\Pages;
 
 use App\Filament\Resources\InquiryResource;
+use App\Filament\Widgets\AiUsageOverview;
 use App\Models\Inquiry;
 use Filament\Resources\Pages\ListRecords;
 use Filament\Resources\Components\Tab;
@@ -12,17 +13,18 @@ class ListInquiries extends ListRecords
 {
     protected static string $resource = InquiryResource::class;
 
-    /**
-     * Default tab: Open (da se Replied/Closed ne prikazuju)
-     */
     public function getDefaultActiveTab(): ?string
     {
         return 'open';
     }
 
-    /**
-     * Tabs iznad tabele: Open / All / Replied / Closed / No AI (po želji)
-     */
+    protected function getHeaderWidgets(): array
+    {
+        return [
+            \App\Filament\Widgets\AiUsageOverview::class,
+        ];
+    }
+
     public function getTabs(): array
     {
         return [
