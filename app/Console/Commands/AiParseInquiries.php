@@ -136,7 +136,6 @@ class AiParseInquiries extends Command
             }
         };
 
-        // ✅ intent + canonical blobs (ključ za date_window, groups, units)
         $set('intent', $out['intent'] ?? null);
 
         // Ova polja su casts=array u modelu
@@ -198,7 +197,6 @@ class AiParseInquiries extends Command
         $set('special_requirements', $out['special_requirements'] ?? null);
         $set('language', $out['language'] ?? null);
 
-        // ✅ deterministički date_to samo kad je date_from realan (ne window)
         if ($inquiry->date_from && $inquiry->nights && ! $inquiry->date_to) {
             try {
                 $inquiry->date_to = Carbon::parse($inquiry->date_from)
