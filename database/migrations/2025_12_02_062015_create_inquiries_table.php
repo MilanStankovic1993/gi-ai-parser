@@ -14,13 +14,16 @@ return new class extends Migration
             // Odakle je došao upit (email, web_form, manual...)
             $table->string('source', 255)->default('email');
 
-            // Stabilan ID za dedupe (ai:source:message_id/hash)
-            // Napomena: nullable+unique je OK u MySQL/Postgres; ingest mora obavezno da popuni external_id za email source.
-            $table->string('external_id', 255)->nullable()->unique();
+            /**
+             * Stabilan ID za dedupe (ai:source:message_id/hash)
+             * MariaDB (767 bytes index limit) + utf8mb4 => max 191 za unique/index varchar.
+             */
+            $table->string('external_id', 191)->nullable();
+            $table->unique('external_id');
 
             // Podaci o gostu
             $table->string('guest_name', 255)->nullable();
-            $table->string('guest_email', 255)->nullable();
+            $table->string('guest_email', 191)->nullable(); // 191 zbog index limita
             $table->string('guest_phone', 255)->nullable();
 
             // Subject
@@ -34,17 +37,19 @@ return new class extends Migration
 
             /**
              * KANONSKI CONTRACT (Faza 1)
+             * Ova MariaDB nema JSON type -> koristimo LONGTEXT i Laravel cast 'array'
              */
             $table->string('intent', 50)->nullable()->index();
-            $table->json('entities')->nullable();
-            $table->json('travel_time')->nullable();
-            $table->json('party')->nullable();
-            $table->json('location_json')->nullable();
-            $table->json('units')->nullable();
-            $table->json('wishes')->nullable();        // tri-state flags: true/false/null
-            $table->json('questions')->nullable();
-            $table->json('tags')->nullable();
-            $table->json('why_no_offer')->nullable();
+
+            $table->longText('entities')->nullable();
+            $table->longText('travel_time')->nullable();
+            $table->longText('party')->nullable();
+            $table->longText('location_json')->nullable();
+            $table->longText('units')->nullable();
+            $table->longText('wishes')->nullable();        // tri-state flags: true/false/null
+            $table->longText('questions')->nullable();
+            $table->longText('tags')->nullable();
+            $table->longText('why_no_offer')->nullable();
 
             // Summary polja (AI popunjava) – ostavljamo za UI/filtere
             $table->string('region', 255)->nullable();
@@ -57,8 +62,8 @@ return new class extends Migration
             $table->unsignedInteger('adults')->nullable();
             $table->unsignedInteger('children')->nullable();
 
-            // JSON: npr [5,3]
-            $table->json('children_ages')->nullable();
+            // JSON: npr [5,3] -> LONGTEXT zbog MariaDB
+            $table->longText('children_ages')->nullable();
 
             // Budžet
             $table->unsignedInteger('budget_min')->nullable();
@@ -94,9 +99,9 @@ return new class extends Migration
                 'manual',
             ])->default('ai_draft');
 
-            // Extraction meta + debug
+            // Extraction meta + debug (JSON -> LONGTEXT)
             $table->string('extraction_mode', 50)->nullable(); // ai|fallback|...
-            $table->json('extraction_debug')->nullable();
+            $table->longText('extraction_debug')->nullable();
 
             $table->boolean('is_priority')->default(false);
 
