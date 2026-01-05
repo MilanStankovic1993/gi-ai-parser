@@ -3,6 +3,7 @@
 namespace App\Providers;
 
 use Illuminate\Support\ServiceProvider;
+use Illuminate\Support\Facades\Schema;
 
 use App\Services\ExcelPriceListParser;
 use App\Services\FakePriceListParser;
@@ -32,6 +33,6 @@ class AppServiceProvider extends ServiceProvider
 
     public function boot(): void
     {
-        //
+       Schema::defaultStringLength(191);
     }
 }
