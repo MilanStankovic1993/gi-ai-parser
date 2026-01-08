@@ -18,19 +18,20 @@ class GiImapPullInquiries extends Command
     {
         $limit = max(1, (int) $this->option('limit'));
 
-        if (empty(env('IMAP_HOST'))) {
-            $this->error('IMAP_HOST is empty in .env.');
+        // ✅ Works with config:cache (env() in runtime would be null)
+        if (empty(config('imap.accounts.default.host'))) {
+            $this->error("IMAP host is empty (config('imap.accounts.default.host')).");
             return self::FAILURE;
         }
 
         $inboxes = [
             'booking' => [
-                'username' => env('IMAP_BOOKING_USERNAME'),
-                'password' => env('IMAP_BOOKING_PASSWORD'),
+                'username' => config('imap.accounts.booking.username'),
+                'password' => config('imap.accounts.booking.password'),
             ],
             'info' => [
-                'username' => env('IMAP_INFO_USERNAME'),
-                'password' => env('IMAP_INFO_PASSWORD'),
+                'username' => config('imap.accounts.info.username'),
+                'password' => config('imap.accounts.info.password'),
             ],
         ];
 
@@ -63,17 +64,8 @@ class GiImapPullInquiries extends Command
 
     private function pullFromInbox(string $inboxKey, string $username, string $password, int $limit): void
     {
-        $client = Client::make([
-            'host'          => env('IMAP_HOST'),
-            'port'          => (int) env('IMAP_PORT', 993),
-            'encryption'    => env('IMAP_ENCRYPTION', 'ssl'),
-            'validate_cert' => filter_var(env('IMAP_VALIDATE_CERT', true), FILTER_VALIDATE_BOOL),
-            'username'      => $username,
-            'password'      => $password,
-            'protocol'      => 'imap',
-            'timeout'       => (int) env('IMAP_TIMEOUT', 30),
-        ]);
-
+        // ✅ Use predefined accounts from config/imap.php (booking/info)
+        $client = Client::account($inboxKey);
         $client->connect();
 
         $folderName = env('AI_IMAP_MAILBOX', 'INBOX') ?: 'INBOX';
