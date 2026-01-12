@@ -83,7 +83,7 @@ class ViewInquiry extends ViewRecord
     }
 
     /**
-     * ✅ Normalizacija whitespace (ubija "rupe" od praznih linija / CRLF)
+     * Normalizacija whitespace (ubija "rupe" od praznih linija / CRLF)
      */
     private function normalizeText($value): string
     {
@@ -99,6 +99,44 @@ class ViewInquiry extends ViewRecord
         $s = preg_replace("/\n{3,}/", "\n\n", $s) ?? $s;
 
         return trim($s);
+    }
+
+    /**
+     * SMTP config read via config() (works with config:cache)
+     */
+    private function resolveSmtpForInbox(string $inbox): array
+    {
+        $inbox = $inbox === 'info' ? 'info' : 'booking';
+
+        $mailer = $inbox === 'info' ? 'smtp_info' : 'smtp_booking';
+
+        $username = config("mail.mailers.$mailer.username");
+        $password = config("mail.mailers.$mailer.password");
+
+        // Support both *_FROM_ADDRESS and *_FROM (you have both variants in env history)
+        if ($inbox === 'info') {
+            $fromAddr = config('mail.inboxes.info.from.address')
+                ?: (config('mail.from.address') ?: 'info@grckainfo.com');
+            $fromName = config('mail.inboxes.info.from.name')
+                ?: (config('mail.from.name') ?: 'GrckaInfo tim');
+        } else {
+            $fromAddr = config('mail.inboxes.booking.from.address')
+                ?: (config('mail.from.address') ?: 'booking@grckainfo.com');
+            $fromName = config('mail.inboxes.booking.from.name')
+                ?: (config('mail.from.name') ?: 'GrckaInfo tim');
+        }
+
+        // Fallbacks if you didn't add mail.inboxes yet:
+        // use env-backed config values via config('...') isn't possible unless added to config;
+        // so we keep sane defaults above.
+
+        return [
+            'mailer'   => $mailer,
+            'username' => $username,
+            'password' => $password,
+            'fromAddr' => $fromAddr,
+            'fromName' => $fromName,
+        ];
     }
 
     protected function getHeaderActions(): array
@@ -156,45 +194,28 @@ class ViewInquiry extends ViewRecord
                     /** @var Inquiry $record */
                     $record = $this->record;
 
-                    $inbox = $data['inbox'] ?? 'booking';
+                    $inbox = ($data['inbox'] ?? 'booking') === 'info' ? 'info' : 'booking';
 
                     $record->subject  = $data['subject'] ?? $record->subject;
                     $record->ai_draft = $data['body'] ?? $record->ai_draft;
                     $record->save();
 
-                    if ($inbox === 'info') {
-                        $smtpUser = env('SMTP_INFO_USERNAME');
-                        $smtpPass = env('SMTP_INFO_PASSWORD');
-                        $fromAddr = env('SMTP_INFO_FROM_ADDRESS', 'info@grckainfo.com');
-                        $fromName = env('SMTP_INFO_FROM_NAME', 'GrckaInfo tim');
-                    } else {
-                        $smtpUser = env('SMTP_BOOKING_USERNAME');
-                        $smtpPass = env('SMTP_BOOKING_PASSWORD');
-                        $fromAddr = env('SMTP_BOOKING_FROM_ADDRESS', 'booking@grckainfo.com');
-                        $fromName = env('SMTP_BOOKING_FROM_NAME', 'GrckaInfo tim');
-                    }
+                    // Use config-based mailer credentials (works with config:cache)
+                    $smtp = $this->resolveSmtpForInbox($inbox);
 
-                    if (blank($smtpUser) || blank($smtpPass) || blank($fromAddr)) {
+                    if (blank($smtp['username']) || blank($smtp['password']) || blank($smtp['fromAddr'])) {
                         Notification::make()
                             ->title('Nedostaju SMTP podaci')
-                            ->body('Popuni SMTP_* u .env za ovaj inbox (username/password/from).')
+                            ->body('Popuni SMTP_* u .env za ovaj inbox (username/password/from) i uradi config:cache na serveru.')
                             ->danger()
                             ->send();
                         return;
                     }
 
-                    config([
-                        'mail.mailers.smtp.host'       => env('MAIL_HOST'),
-                        'mail.mailers.smtp.port'       => (int) env('MAIL_PORT', 587),
-                        'mail.mailers.smtp.encryption' => env('MAIL_ENCRYPTION', 'tls'),
-                        'mail.mailers.smtp.username'   => $smtpUser,
-                        'mail.mailers.smtp.password'   => $smtpPass,
-                    ]);
-
                     try {
-                        Mail::to($record->guest_email)->send(
-                            new InquiryDraftMail($record, $fromAddr, $fromName)
-                        );
+                        Mail::mailer($smtp['mailer'])
+                            ->to($record->guest_email)
+                            ->send(new InquiryDraftMail($record, $smtp['fromAddr'], $smtp['fromName']));
                     } catch (\Throwable $e) {
                         Notification::make()
                             ->title('Slanje nije uspelo')
@@ -837,7 +858,6 @@ class ViewInquiry extends ViewRecord
                                                     ->columnSpanFull()
                                                     ->default('-'),
 
-                                                // ✅ FIX: bez prose + normalizacija whitespace
                                                 TextEntry::make('raw_message')
                                                     ->label('Tekst upita')
                                                     ->columnSpanFull()
@@ -853,7 +873,6 @@ class ViewInquiry extends ViewRecord
                                             ->schema([
                                                 Section::make('Ekstrahovani podaci (summary)')
                                                     ->schema([
-                                                        // ✅ FIX: bez prose (prose pravi ogromne margine/paragrafe)
                                                         TextEntry::make('groups_summary')
                                                             ->label('Porodice / grupe')
                                                             ->state(fn (Inquiry $record) => $this->formatGroupsSummary($record))
@@ -965,6 +984,7 @@ class ViewInquiry extends ViewRecord
                                                                     ]),
                                                                 TextEntry::make('special_requirements')->label('Napomena')->default('-')->columnSpanFull(),
                                                             ]),
+
                                                     ]),
 
                                                 Section::make('AI Audit (ai_inquiries)')
@@ -974,7 +994,6 @@ class ViewInquiry extends ViewRecord
                                                         TextEntry::make('ai_status')->label('ai_inquiries.status')->state(fn (Inquiry $record) => (string) ($record->aiInquiry?->status ?? '-')),
                                                         TextEntry::make('ai_intent')->label('ai_inquiries.intent')->state(fn (Inquiry $record) => (string) ($record->aiInquiry?->intent ?? '-')),
 
-                                                        // ✅ FIX: bez prose + pre-wrap
                                                         TextEntry::make('ai_missing_fields')
                                                             ->label('ai_inquiries.missing_fields')
                                                             ->state(fn (Inquiry $record) => $this->prettyJson($record->aiInquiry?->missing_fields))
@@ -1011,17 +1030,17 @@ class ViewInquiry extends ViewRecord
                                     ->columnSpanFull(),
                             ]),
 
-                    Tab::make('AI draft odgovor')
-                        ->schema([
-                            TextEntry::make('ai_draft')
-                                ->label('Predlog odgovora')
-                                ->default('-')
-                                ->columnSpanFull()
-                                ->markdown()
-                                ->extraAttributes([
-                                    'class' => 'prose dark:prose-invert max-w-none',
-                                ]),
-                        ]),
+                        Tab::make('AI draft odgovor')
+                            ->schema([
+                                TextEntry::make('ai_draft')
+                                    ->label('Predlog odgovora')
+                                    ->default('-')
+                                    ->columnSpanFull()
+                                    ->markdown()
+                                    ->extraAttributes([
+                                        'class' => 'prose dark:prose-invert max-w-none',
+                                    ]),
+                            ]),
                     ])
                     ->persistTabInQueryString(),
             ]);

@@ -18,9 +18,7 @@ class InquiryAiExtractor
             return $this->fallbackExtract($inquiry);
         }
 
-        $aiEnabled =
-            (bool) config('app.ai_enabled', false) ||
-            (string) env('AI_ENABLED', 'false') === 'true';
+        $aiEnabled = (bool) config('app.ai_enabled', false);
 
         if (! $aiEnabled) {
             return $this->fallbackExtract($inquiry);

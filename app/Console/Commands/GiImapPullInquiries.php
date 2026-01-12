@@ -68,14 +68,14 @@ class GiImapPullInquiries extends Command
         $client = Client::account($inboxKey);
         $client->connect();
 
-        $folderName = env('AI_IMAP_MAILBOX', 'INBOX') ?: 'INBOX';
+        $folderName   = (string) (config('ai.imap.mailbox', 'INBOX') ?: 'INBOX');
         $folder = $client->getFolder($folderName);
 
-        $lookbackDays = max(1, (int) env('AI_IMAP_LOOKBACK_DAYS', 7));
+        $lookbackDays = max(1, (int) config('ai.imap.lookback_days', 7));
         $since = now()->subDays($lookbackDays);
 
         // unseen (prod) / all (test)
-        $mode = strtolower((string) env('AI_IMAP_FETCH_MODE', 'unseen')); // unseen|all
+        $mode         = strtolower((string) config('ai.imap.fetch_mode', 'unseen'));
 
         $query = $folder->query();
 
