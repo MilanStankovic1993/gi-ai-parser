@@ -212,17 +212,53 @@ class ViewInquiry extends ViewRecord
                         return;
                     }
 
+                    // 1) Primary send (booking/info based on source)
                     try {
                         Mail::mailer($smtp['mailer'])
                             ->to($record->guest_email)
                             ->send(new InquiryDraftMail($record, $smtp['fromAddr'], $smtp['fromName']));
                     } catch (\Throwable $e) {
-                        Notification::make()
-                            ->title('Slanje nije uspelo')
-                            ->body($e->getMessage())
-                            ->danger()
-                            ->send();
-                        return;
+
+                        // 2) Fallback: if booking fails, try via info
+                        if ($smtp['mailer'] === 'smtp_booking') {
+                            try {
+                                $fallback = $this->resolveSmtpForInbox('info');
+
+                                if (blank($fallback['username']) || blank($fallback['password']) || blank($fallback['fromAddr'])) {
+                                    Notification::make()
+                                        ->title('Slanje nije uspelo')
+                                        ->body($e->getMessage())
+                                        ->danger()
+                                        ->send();
+                                    return;
+                                }
+
+                                Mail::mailer($fallback['mailer'])
+                                    ->to($record->guest_email)
+                                    ->send(new InquiryDraftMail($record, $fallback['fromAddr'], $fallback['fromName']));
+
+                                // Optional: notify that fallback was used
+                                Notification::make()
+                                    ->title('Mejl je poslat (fallback)')
+                                    ->body('Slanje preko booking inbox-a nije uspelo, poslato je preko info inbox-a.')
+                                    ->warning()
+                                    ->send();
+                            } catch (\Throwable $e2) {
+                                Notification::make()
+                                    ->title('Slanje nije uspelo (ni fallback)')
+                                    ->body($e2->getMessage())
+                                    ->danger()
+                                    ->send();
+                                return;
+                            }
+                        } else {
+                            Notification::make()
+                                ->title('Slanje nije uspelo')
+                                ->body($e->getMessage())
+                                ->danger()
+                                ->send();
+                            return;
+                        }
                     }
 
                     $record->status = 'replied';

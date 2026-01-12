@@ -42,10 +42,11 @@ class InquiryDraftMail extends Mailable
 
     public function content(): Content
     {
+        // šaljemo kao HTML view, a view pretvara Markdown -> HTML
         return new Content(
-            text: 'emails.inquiry-draft',
+            html: 'emails.inquiry-draft',
             with: [
-                'body' => $this->inquiry->ai_draft ?: '',
+                'body' => (string) ($this->inquiry->ai_draft ?: ''),
             ]
         );
     }
@@ -68,21 +69,18 @@ class InquiryDraftMail extends Mailable
 
     private function getOriginalMessageId(): ?string
     {
-        // 1) Prefer ai_inquiries.message_id (to je pravi Message-ID originalnog mejla)
+        // 1) Prefer ai_inquiries.message_id (pravi Message-ID originalnog mejla)
         $ai = $this->inquiry->relationLoaded('aiInquiry')
             ? $this->inquiry->aiInquiry
             : $this->inquiry->aiInquiry()->first();
 
-        $mid = $ai?->message_id;
-        $mid = $this->normalizeMessageId($mid);
+        $mid = $this->normalizeMessageId($ai?->message_id);
         if ($mid) return $mid;
 
-        // 2) Fallback: pokušaj da izvučeš <...> iz external_id ako ga tamo nosiš
-        $ex = (string) ($this->inquiry->external_id ?? '');
-        if ($ex !== '') {
-            if (preg_match('/<[^>]+>/', $ex, $m)) {
-                return $this->normalizeMessageId($m[0]);
-            }
+        // 2) Fallback: pokušaj da izvučeš <...> iz external_id
+        $ex = trim((string) ($this->inquiry->external_id ?? ''));
+        if ($ex !== '' && preg_match('/<[^>]+>/', $ex, $m)) {
+            return $this->normalizeMessageId($m[0]);
         }
 
         return null;
@@ -93,13 +91,12 @@ class InquiryDraftMail extends Mailable
         $raw = trim((string) $raw);
         if ($raw === '') return null;
 
-        // ako već ima <...>, izvuci ga i vrati samo to
+        // ako već ima <...>, vrati to
         if (preg_match('/<[^>]+>/', $raw, $m)) {
             return $m[0];
         }
 
-        // ako je "gola" vrednost (bez uglastih zagrada), uokviri
-        // (minimalna validacija: ne sme imati razmake)
+        // minimalna validacija: ne sme imati razmake
         if (str_contains($raw, ' ')) {
             return null;
         }

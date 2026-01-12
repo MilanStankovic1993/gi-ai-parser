@@ -32,20 +32,17 @@ class InquiryOfferDraftBuilder
             $lines[] = "";
         }
 
-        // ✅ grupiši po unit_index
         $grouped = $candidates
             ->values()
             ->groupBy(fn ($c) => (int) (data_get($c, 'unit_index') ?? 1))
             ->sortKeys();
 
-        // ✅ izvuci party.groups (za multi-unit)
-        $groups = $this->getPartyGroups($inquiry);
+        $groups  = $this->getPartyGroups($inquiry);
         $isMulti = count($groups) >= 2;
 
         foreach ($grouped as $unitIndex => $items) {
             $lines[] = "=== Apartman / jedinica {$unitIndex} ===";
 
-            // ✅ po jedinici: prikaži sastav iz party.groups[unitIndex-1]
             if ($isMulti) {
                 $g = $groups[$unitIndex - 1] ?? null;
 
@@ -60,7 +57,6 @@ class InquiryOfferDraftBuilder
                 $ages = is_array($ages) ? array_values($ages) : [];
                 $agesTxt = ($unitKids > 0 && count($ages)) ? implode(', ', $ages) : null;
 
-                // ako nema group (ne bi trebalo, ali da ne “puca”)
                 if ($unitAdults > 0 || $unitKids > 0) {
                     $s = "Sastav: {$unitAdults} odraslih, {$unitKids} dece";
                     if ($agesTxt) $s .= " (uzrast: {$agesTxt})";
@@ -75,12 +71,14 @@ class InquiryOfferDraftBuilder
             foreach ($top as $idx => $c) {
                 $n = $idx + 1;
 
-                $hotelTitle = data_get($c, 'hotel.hotel_title')
-                    ?? data_get($c, 'hotel.title')
+                $hotel = data_get($c, 'hotel', []);
+
+                $hotelTitle = data_get($hotel, 'hotel_title')
+                    ?? data_get($hotel, 'title')
                     ?? data_get($c, 'name')
                     ?? 'Smeštaj';
 
-                $location = data_get($c, 'hotel.mesto')
+                $location = data_get($hotel, 'mesto')
                     ?? data_get($c, 'location')
                     ?? ($inquiry->location ?? null);
 
@@ -91,19 +89,27 @@ class InquiryOfferDraftBuilder
 
                 $priceText = $total !== null ? $this->money($total) : null;
 
-                $url = data_get($c, 'url') ?? data_get($c, 'hotel.link') ?? data_get($c, 'hotel.url') ?? null;
-                if ($url && ! str_starts_with($url, 'http')) $url = 'https://' . ltrim($url, '/');
+                $titleText = $hotelTitle . ($location ? " – {$location}" : "");
 
-                $title = $hotelTitle . ($location ? " – {$location}" : "");
-                $lines[] = "{$n}. {$title}";
+                // ✅ pokušaj da nađeš kanonski /sr/smestaj/slug/id/
+                // ako ne može, vraća raw link (ako postoji), čisto da bude klikabilno
+                $url = $this->resolvePublicUrl($hotel, $c);
+
+                if ($url) {
+                    $lines[] = "{$n}. [{$titleText}]({$url})";
+                } else {
+                    $lines[] = "{$n}. {$titleText}";
+                }
 
                 $bits = [];
                 if ($roomTitle) $bits[] = "Tip: {$roomTitle}";
                 if ($priceText && $nights) $bits[] = "Cena: {$priceText} za {$nights} noćenja";
                 elseif ($priceText) $bits[] = "Cena: {$priceText}";
 
-                if (! empty($bits)) $lines[] = "• " . implode(" • ", $bits);
-                if ($url) $lines[] = "• Link: {$url}";
+                if (! empty($bits)) {
+                    $lines[] = "• " . implode(" • ", $bits);
+                }
+
                 $lines[] = "";
             }
         }
@@ -128,6 +134,76 @@ class InquiryOfferDraftBuilder
         $lines[] = "https://grckainfo.com";
 
         return implode("\n", $lines);
+    }
+
+    private function resolvePublicUrl($hotel, $candidate): ?string
+    {
+        // prvo pokupi "raw" link iz bilo kog polja koje već imaš
+        $raw = data_get($hotel, 'public_url')
+            ?? data_get($hotel, 'link')
+            ?? data_get($hotel, 'url')
+            ?? data_get($candidate, 'url')
+            ?? data_get($candidate, 'link')
+            ?? null;
+
+        $raw = $raw ? trim((string) $raw) : null;
+
+        // 1) Ako već dobijamo tačan kanonski link – koristi ga
+        if ($raw && preg_match('~^https?://~i', $raw) && preg_match('~/sr/smestaj/[^/]+/\d+/?$~i', $raw)) {
+            return $raw;
+        }
+
+        // 2) Izvuci slug iz raw linka (ako je tipa /smestaj/sias-cozy-house ili /sr/smestaj/sias-cozy-house)
+        $slugFromRaw = null;
+        if ($raw && preg_match('~/(?:sr/)?smestaj/([^/]+)/?~i', $raw, $m)) {
+            $slugFromRaw = $m[1] ?? null;
+            $slugFromRaw = is_string($slugFromRaw) ? trim($slugFromRaw) : null;
+        }
+
+        // 3) Skupi ID iz što više realnih varijanti
+        $id = data_get($hotel, 'id')
+            ?? data_get($hotel, 'hotel_id')
+            ?? data_get($hotel, 'smestaj_id')
+            ?? data_get($hotel, 'object_id')
+            ?? data_get($hotel, 'listing_id')
+            ?? data_get($hotel, 'pt_hotel_id')
+            ?? data_get($candidate, 'hotel.id')
+            ?? data_get($candidate, 'hotel.hotel_id')
+            ?? data_get($candidate, 'hotel.smestaj_id')
+            ?? data_get($candidate, 'hotel_id')
+            ?? data_get($candidate, 'smestaj_id')
+            ?? data_get($candidate, 'accommodation_id')
+            ?? data_get($candidate, 'object_id')
+            ?? data_get($candidate, 'listing_id')
+            ?? data_get($candidate, 'id')
+            ?? null;
+
+        $id = is_numeric($id) ? (int) $id : null;
+
+        // 4) Skupi slug iz više polja, ili fallback na raw slug
+        $slug = data_get($hotel, 'slug')
+            ?? data_get($candidate, 'hotel.slug')
+            ?? data_get($candidate, 'hotel_slug')
+            ?? data_get($candidate, 'slug')
+            ?? $slugFromRaw
+            ?? null;
+
+        $slug = is_string($slug) ? trim($slug) : null;
+
+        // ✅ ako imamo id+slug -> pravi tačan link koji radi
+        if ($id && $slug) {
+            return "https://grckainfo.com/sr/smestaj/{$slug}/{$id}/";
+        }
+
+        // 5) Ako ne možemo kanonski, vrati raw samo da bude klikabilno (može biti 404 ako sajt traži ID)
+        // Ako NE želiš ni raw (da izbegneš 404), samo vrati null umesto ovoga.
+        if ($raw) {
+            // popravi www varijantu
+            $raw = preg_replace('~^https?://www\.grckainfo\.com~i', 'https://grckainfo.com', $raw) ?: $raw;
+            return $raw;
+        }
+
+        return null;
     }
 
     private function getPartyGroups(Inquiry $i): array
@@ -157,12 +233,10 @@ class InquiryOfferDraftBuilder
 
     private function formatPeriod(Inquiry $i): ?string
     {
-        // exact
         if ($i->date_from && $i->date_to) {
             return $i->date_from->format('d.m.Y') . " – " . $i->date_to->format('d.m.Y');
         }
 
-        // window
         $wf = data_get($i, 'travel_time.date_window.from');
         $wt = data_get($i, 'travel_time.date_window.to');
         $n  = (int) (data_get($i, 'travel_time.nights') ?: ($i->nights ?? 0));

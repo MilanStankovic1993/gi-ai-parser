@@ -1,3 +1,4 @@
+{{-- resources/views/ai/templates/no-primary-with-alternatives.blade.php --}}
 Poštovani{{ $guest ? ' ' . $guest : '' }},
 
 Hvala vam na javljanju i interesovanju za letovanje u Grčkoj.
@@ -7,12 +8,14 @@ Na osnovu traženih kriterijuma, trenutno nemamo dostupnu ponudu koja u potpunos
 Ipak, u nastavku šaljemo 4–5 alternativnih predloga koji bi mogli biti interesantni:
 
 @foreach(($alternatives ?? []) as $idx => $a)
-{{ $idx + 1 }}. {{ $a['title'] ?? ($a['name'] ?? 'Smeštaj') }}
+{{ $idx + 1 }}.
+@if(!empty($a['url']))
+<a href="{{ $a['url'] }}">{{ $a['title'] ?? ($a['name'] ?? 'Smeštaj') }}</a>
+@else
+{{ $a['title'] ?? ($a['name'] ?? 'Smeštaj') }}
+@endif
 @if(!empty($a['price']))
 • Cena: {{ $a['price'] }}
-@endif
-@if(!empty($a['url']))
-• Link: {{ $a['url'] }}
 @endif
 
 @endforeach
