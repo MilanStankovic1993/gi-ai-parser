@@ -46,21 +46,21 @@ Schedule::command('ai:sync-inquiries --limit=50')
     ->runInBackground()
     ->onOneServer();
 
-// 3) Parse inquiries (može biti skuplje kad uključiš AI)
-Schedule::command('ai:parse --limit=50')
-    ->everyTwoMinutes()
-    ->name('ai:parse')
-    ->withoutOverlapping(10)
-    ->runInBackground()
-    ->onOneServer();
+// // 3) Parse inquiries (može biti skuplje kad uključiš AI)
+// Schedule::command('ai:parse --limit=50')
+//     ->everyTwoMinutes()
+//     ->name('ai:parse')
+//     ->withoutOverlapping(10)
+//     ->runInBackground()
+//     ->onOneServer();
 
-// 4) Suggest hotels
-Schedule::command('ai:suggest --limit=50')
-    ->everyTwoMinutes()
-    ->name('ai:suggest')
-    ->withoutOverlapping(10)
-    ->runInBackground()
-    ->onOneServer();
+// // 4) Suggest hotels
+// Schedule::command('ai:suggest --limit=50')
+//     ->everyTwoMinutes()
+//     ->name('ai:suggest')
+//     ->withoutOverlapping(10)
+//     ->runInBackground()
+//     ->onOneServer();
 
 /*
 |--------------------------------------------------------------------------
