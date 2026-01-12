@@ -31,20 +31,20 @@ Artisan::command('inspire', function () {
 */
 
 // 1) IMAP ingest (Gmail) -> ai_inquiries
-Schedule::command('gi:imap-pull --limit=30')
-    ->everyMinute()
-    ->name('gi:imap-pull')
-    ->withoutOverlapping(5)
-    ->runInBackground()
-    ->onOneServer();
+// Schedule::command('gi:imap-pull --limit=30')
+//     ->everyMinute()
+//     ->name('gi:imap-pull')
+//     ->withoutOverlapping(5)
+//     ->runInBackground()
+//     ->onOneServer();
 
-// 2) Sync ai_inquiries -> inquiries
-Schedule::command('ai:sync-inquiries --limit=50')
-    ->everyMinute()
-    ->name('ai:sync-inquiries')
-    ->withoutOverlapping(5)
-    ->runInBackground()
-    ->onOneServer();
+// // 2) Sync ai_inquiries -> inquiries
+// Schedule::command('ai:sync-inquiries --limit=50')
+//     ->everyMinute()
+//     ->name('ai:sync-inquiries')
+//     ->withoutOverlapping(5)
+//     ->runInBackground()
+//     ->onOneServer();
 
 // // 3) Parse inquiries (može biti skuplje kad uključiš AI)
 // Schedule::command('ai:parse --limit=50')
