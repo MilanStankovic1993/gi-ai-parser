@@ -32,7 +32,7 @@ Artisan::command('inspire', function () {
 
 // 1) IMAP ingest (Gmail) -> ai_inquiries
 // Schedule::command('gi:imap-pull --limit=30')
-//     ->everyMinute()
+//     ->everyThreeMinutes()
 //     ->name('gi:imap-pull')
 //     ->withoutOverlapping(5)
 //     ->runInBackground()
@@ -40,7 +40,7 @@ Artisan::command('inspire', function () {
 
 // // 2) Sync ai_inquiries -> inquiries
 // Schedule::command('ai:sync-inquiries --limit=50')
-//     ->everyMinute()
+//     ->everyThreeMinutes()
 //     ->name('ai:sync-inquiries')
 //     ->withoutOverlapping(5)
 //     ->runInBackground()
@@ -48,7 +48,7 @@ Artisan::command('inspire', function () {
 
 // // 3) Parse inquiries (može biti skuplje kad uključiš AI)
 // Schedule::command('ai:parse --limit=50')
-//     ->everyTwoMinutes()
+//     ->everyFiveMinutes()
 //     ->name('ai:parse')
 //     ->withoutOverlapping(10)
 //     ->runInBackground()
@@ -56,7 +56,7 @@ Artisan::command('inspire', function () {
 
 // // 4) Suggest hotels
 // Schedule::command('ai:suggest --limit=50')
-//     ->everyTwoMinutes()
+//     ->everyFiveMinutes()
 //     ->name('ai:suggest')
 //     ->withoutOverlapping(10)
 //     ->runInBackground()
