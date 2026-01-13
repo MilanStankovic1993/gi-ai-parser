@@ -12,6 +12,10 @@ class InquiryMissingData
      * - Ako fale ključni podaci (period + lokacija + broj osoba) -> NE nudimo smeštaje, samo pitanja.
      * - Ako ima dece -> uzrast dece je obavezan (po grupi, kad postoje grupe).
      * - Budžet je poželjan, ali nije blokator.
+     *
+     * DOPUNA:
+     * - Ako je intent = specific_property i imamo traženi smeštaj (requested hotel),
+     *   lokacija/regija nije obavezna (prvo tražimo po objektu).
      */
     public static function detect(Inquiry $i): array
     {
@@ -24,20 +28,15 @@ class InquiryMissingData
             return $missing;
         }
 
-        // tekst (heuristike)
         $text = mb_strtolower((string) ($i->raw_message ?? ''));
 
         // ---------------------------
-        // Travel time
+        // Travel time (RELAXED)
         // ---------------------------
         $travel = is_array($i->travel_time) ? $i->travel_time : [];
+        $monthHint = $travel['month_hint'] ?? ($i->month_hint ?: null);
 
-        $dateFrom  = $travel['date_from'] ?? ($i->date_from ? $i->date_from->toDateString() : null);
-        $dateTo    = $travel['date_to']   ?? ($i->date_to ? $i->date_to->toDateString() : null);
-        // $monthHint = $travel['month_hint'] ?? ($i->month_hint ?: null);
-
-        // ✅ Dates gate: exact OR window+nights
-        $hasExactDates = filled($i->date_from) && (filled($i->date_to) || (int) $i->nights > 0);
+        $hasDateFrom = filled($i->date_from) || filled($travel['date_from'] ?? null);
 
         $winFrom = data_get($i, 'travel_time.date_window.from');
         $winTo   = data_get($i, 'travel_time.date_window.to');
@@ -45,15 +44,10 @@ class InquiryMissingData
 
         $hasNights = (int) (($i->nights ?? null) ?: data_get($i, 'travel_time.nights', 0)) > 0;
 
-        if (! ($hasExactDates || ($hasWindow && $hasNights))) {
-            $missing[] = 'tačne datume boravka (od–do) ili okvirni period + broj noćenja (npr. 23.06 ±3 dana na 10 noći)';
-        }
+        $hasAnyTimeHint = $hasDateFrom || filled($monthHint) || ($hasWindow && $hasNights);
 
-        // ---------------------------
-        // Location
-        // ---------------------------
-        if (! filled($i->region) && ! filled($i->location)) {
-            $missing[] = 'željenu lokaciju/regiju (mesto ili oblast u Grčkoj)';
+        if (! $hasAnyTimeHint) {
+            $missing[] = 'period boravka (npr. od 01.08 ili avgust)';
         }
 
         // ---------------------------
@@ -68,7 +62,6 @@ class InquiryMissingData
         }
         $groups = is_array($groups) ? $groups : [];
 
-        // Heuristic: da li poruka pominje decu i uzrast (kada nema strukturiranih podataka)
         $mentionsKids = Str::contains($text, [
             'dete', 'deca', 'djeca', 'klinac', 'klinci', 'beba', 'baby',
         ]);
@@ -79,34 +72,24 @@ class InquiryMissingData
             $hasAnyChildren = false;
             $missingAgesForGroups = false;
 
-            foreach ($groups as $idx => $g) {
+            foreach ($groups as $g) {
                 if (! is_array($g)) continue;
 
                 $adults   = self::toIntOrNull($g['adults'] ?? null);
                 $children = self::toIntOrNull($g['children'] ?? null);
 
-                if ($adults !== null && $adults > 0) {
-                    $hasAdultsSomewhere = true;
-                }
+                if ($adults !== null && $adults > 0) $hasAdultsSomewhere = true;
 
                 if ($children !== null && $children > 0) {
                     $hasAnyChildren = true;
 
                     $ages = $g['children_ages'] ?? ($g['ages'] ?? null);
-                    $ages = self::normalizeChildrenAges($ages) ?? []; // ✅ FIX: count() safe
+                    $ages = self::normalizeChildrenAges($ages) ?? [];
 
-                    if (count($ages) === 0) {
-                        $missingAgesForGroups = true;
-                    } elseif (count($ages) < $children) {
+                    if (count($ages) === 0 || count($ages) < $children) {
                         $missingAgesForGroups = true;
                     }
                 }
-            }
-
-            if ($hasAdultsSomewhere && ! $hasAnyChildren && ! $mentionsKids) {
-                // samo preskoči kids validaciju, ali nastavi dalje
-                // (ovde u groups grani svakako vraćaš rezultat, pa je ok return)
-                return array_values(array_unique(array_filter($missing)));
             }
 
             if (! $hasAdultsSomewhere) {
@@ -119,33 +102,105 @@ class InquiryMissingData
                 $missing[] = 'uzrast dece';
             }
 
-            return array_values(array_unique(array_filter($missing)));
+            // Location gate ide POSLE ovoga (da imamo intent + requested property info)
+            // ali u groups grani ne prekidamo ranije – nastavljamo dalje.
+        } else {
+            // ---------------------------
+            // Party fallback (legacy fields)
+            // ---------------------------
+            $adults = self::toIntOrNull($party['adults'] ?? $i->adults);
+            if (! $adults || $adults <= 0) {
+                $missing[] = 'broj odraslih osoba';
+            }
+
+            $children = self::toIntOrNull($party['children'] ?? $i->children);
+
+            $ages = $party['ages'] ?? $party['children_ages'] ?? $i->children_ages ?? [];
+            $ages = self::normalizeChildrenAges($ages) ?? [];
+
+            if ($children === null && $mentionsKids) {
+                $missing[] = 'broj dece i uzrast dece';
+            } elseif ($children !== null && $children > 0) {
+                if (count($ages) === 0 || count($ages) < $children) {
+                    $missing[] = 'uzrast dece';
+                }
+            }
         }
 
         // ---------------------------
-        // Party fallback (legacy fields)
+        // Requested property short-circuit (IMPORTANT)
         // ---------------------------
-        $adults = self::toIntOrNull($party['adults'] ?? $i->adults);
-        if (! $adults || $adults <= 0) {
-            $missing[] = 'broj odraslih osoba';
-        }
+        // Ako korisnik jasno traži objekat, lokacija nije obavezna.
+        $hasRequestedProperty = self::hasRequestedProperty($i);
 
-        $children = self::toIntOrNull($party['children'] ?? $i->children);
-
-        $ages = $party['ages'] ?? $party['children_ages'] ?? $i->children_ages ?? [];
-        $ages = self::normalizeChildrenAges($ages) ?? []; // ✅ FIX: count() safe
-
-        if ($children === null && $mentionsKids) {
-            $missing[] = 'broj dece i uzrast dece';
-        } elseif ($children !== null && $children > 0) {
-            if (count($ages) === 0) {
-                $missing[] = 'uzrast dece';
-            } elseif (count($ages) < $children) {
-                $missing[] = 'uzrast dece';
+        // ---------------------------
+        // Location (ONLY if needed)
+        // ---------------------------
+        if (! $hasRequestedProperty) {
+            if (! filled($i->region) && ! filled($i->location)) {
+                $missing[] = 'željenu lokaciju/regiju (mesto ili oblast u Grčkoj)';
             }
         }
 
         return array_values(array_unique(array_filter($missing)));
+    }
+
+    /**
+     * True ako imamo traženi smeštaj iz extractor-a ili iz poruke.
+     */
+    private static function hasRequestedProperty(Inquiry $i): bool
+    {
+        if ((string) ($i->intent ?? '') !== 'specific_property') {
+            return false;
+        }
+
+        // 1) units.property_candidates
+        $units = $i->units;
+
+        if (is_string($units)) {
+            $decoded = json_decode($units, true);
+            $units = is_array($decoded) ? $decoded : [];
+        }
+
+        if (is_array($units)) {
+            foreach ($units as $u) {
+                if (! is_array($u)) continue;
+
+                $pc = $u['property_candidates'] ?? [];
+                if (is_string($pc)) {
+                    $decoded = json_decode($pc, true);
+                    $pc = is_array($decoded) ? $decoded : [];
+                }
+
+                if (is_array($pc) && count($pc) > 0) {
+                    foreach ($pc as $row) {
+                        $q = is_array($row) ? trim((string) ($row['query'] ?? '')) : trim((string) $row);
+                        if ($q !== '') return true;
+                    }
+                }
+            }
+        }
+
+        // 2) extraction_debug.requested_hotels
+        if (is_array($i->extraction_debug ?? null)) {
+            $req = $i->extraction_debug['requested_hotels'] ?? null;
+            if (is_array($req)) {
+                foreach ($req as $n) {
+                    if (trim((string) $n) !== '') return true;
+                }
+            }
+        }
+
+        // 3) raw_message heuristic: "informacija o X", "da li ima slobodno u X", "interesuje me X"
+        $raw = mb_strtolower((string) ($i->raw_message ?? ''));
+        if ($raw !== '') {
+            if (preg_match('/(informacija o|info o|slobodno u|za)\s+([^\n\r\.\,]{3,})/iu', $raw, $m)) {
+                $candidate = trim((string) ($m[2] ?? ''));
+                if (mb_strlen($candidate) >= 3) return true;
+            }
+        }
+
+        return false;
     }
 
     private static function toIntOrNull(mixed $v): ?int
@@ -182,7 +237,6 @@ class InquiryMissingData
                 $n = 1;
             }
 
-            // valid range
             if ($n >= 1 && $n <= 17) {
                 return $n;
             }
@@ -190,7 +244,6 @@ class InquiryMissingData
             return null;
         };
 
-        // već array
         if (is_array($value)) {
             $out = [];
 
@@ -203,7 +256,7 @@ class InquiryMissingData
                 if (preg_match('/\d+/', $s, $m)) {
                     $n = $normalizeOne($m[0]);
                     if ($n !== null) {
-                        $out[] = $n; // ✅ NE unique
+                        $out[] = $n;
                     }
                 }
             }
@@ -211,7 +264,6 @@ class InquiryMissingData
             return count($out) ? array_values($out) : null;
         }
 
-        // string
         $s = trim((string) $value);
         if ($s === '') {
             return null;

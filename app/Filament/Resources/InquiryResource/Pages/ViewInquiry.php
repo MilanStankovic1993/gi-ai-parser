@@ -113,7 +113,6 @@ class ViewInquiry extends ViewRecord
         $username = config("mail.mailers.$mailer.username");
         $password = config("mail.mailers.$mailer.password");
 
-        // Support both *_FROM_ADDRESS and *_FROM (you have both variants in env history)
         if ($inbox === 'info') {
             $fromAddr = config('mail.inboxes.info.from.address')
                 ?: (config('mail.from.address') ?: 'info@grckainfo.com');
@@ -125,10 +124,6 @@ class ViewInquiry extends ViewRecord
             $fromName = config('mail.inboxes.booking.from.name')
                 ?: (config('mail.from.name') ?: 'GrckaInfo tim');
         }
-
-        // Fallbacks if you didn't add mail.inboxes yet:
-        // use env-backed config values via config('...') isn't possible unless added to config;
-        // so we keep sane defaults above.
 
         return [
             'mailer'   => $mailer,
@@ -200,7 +195,6 @@ class ViewInquiry extends ViewRecord
                     $record->ai_draft = $data['body'] ?? $record->ai_draft;
                     $record->save();
 
-                    // Use config-based mailer credentials (works with config:cache)
                     $smtp = $this->resolveSmtpForInbox($inbox);
 
                     if (blank($smtp['username']) || blank($smtp['password']) || blank($smtp['fromAddr'])) {
@@ -212,14 +206,12 @@ class ViewInquiry extends ViewRecord
                         return;
                     }
 
-                    // 1) Primary send (booking/info based on source)
                     try {
                         Mail::mailer($smtp['mailer'])
                             ->to($record->guest_email)
                             ->send(new InquiryDraftMail($record, $smtp['fromAddr'], $smtp['fromName']));
                     } catch (\Throwable $e) {
 
-                        // 2) Fallback: if booking fails, try via info
                         if ($smtp['mailer'] === 'smtp_booking') {
                             try {
                                 $fallback = $this->resolveSmtpForInbox('info');
@@ -237,7 +229,6 @@ class ViewInquiry extends ViewRecord
                                     ->to($record->guest_email)
                                     ->send(new InquiryDraftMail($record, $fallback['fromAddr'], $fallback['fromName']));
 
-                                // Optional: notify that fallback was used
                                 Notification::make()
                                     ->title('Mejl je poslat (fallback)')
                                     ->body('Slanje preko booking inbox-a nije uspelo, poslato je preko info inbox-a.')
@@ -479,7 +470,6 @@ class ViewInquiry extends ViewRecord
                         ->send();
                 }),
 
-            // sve ostalo ostaje kako si imao
             Actions\Action::make('run_ai_extraction')
                 ->label('Run extraction')
                 ->icon('heroicon-o-sparkles')
@@ -496,18 +486,23 @@ class ViewInquiry extends ViewRecord
                     $extractor = app(InquiryAiExtractor::class);
                     $data = $extractor->extract($record);
 
+                    // --- canonical payloads (stable shapes) ---
                     $entities   = is_array($data['entities'] ?? null) ? $data['entities'] : null;
                     $travelTime = is_array($data['travel_time'] ?? null) ? $data['travel_time'] : null;
+                    $party      = is_array($data['party'] ?? null) ? $data['party'] : [];
+                    $units      = is_array($data['units'] ?? null) ? $data['units'] : [];
+                    $wishes     = is_array($data['wishes'] ?? null) ? $data['wishes'] : [];
+                    $questions  = is_array($data['questions'] ?? null) ? $data['questions'] : [];
+                    $tags       = is_array($data['tags'] ?? null) ? $data['tags'] : [];
+                    $why        = is_array($data['why_no_offer'] ?? null) ? $data['why_no_offer'] : [];
+                    $locationJson = is_array($data['location_json'] ?? null) ? $data['location_json'] : null;
 
-                    $party     = is_array($data['party'] ?? null) ? $data['party'] : [];
-                    $units     = is_array($data['units'] ?? null) ? $data['units'] : [];
-                    $wishes    = is_array($data['wishes'] ?? null) ? $data['wishes'] : [];
-                    $questions = is_array($data['questions'] ?? null) ? $data['questions'] : [];
-                    $tags      = is_array($data['tags'] ?? null) ? $data['tags'] : [];
-                    $why       = is_array($data['why_no_offer'] ?? null) ? $data['why_no_offer'] : [];
+                    // intent
+                    if (array_key_exists('intent', $data) && filled($data['intent'])) {
+                        $record->intent = (string) $data['intent'];
+                    }
 
-                    $record->intent = $data['intent'] ?? $record->intent;
-
+                    // entities (fallback to legacy keys if needed)
                     $record->entities = $entities ?: [
                         'property_candidates' => is_array($data['property_candidates'] ?? null) ? $data['property_candidates'] : [],
                         'location_candidates' => is_array($data['location_candidates'] ?? null) ? $data['location_candidates'] : [],
@@ -515,15 +510,28 @@ class ViewInquiry extends ViewRecord
                         'date_candidates'     => is_array($data['date_candidates'] ?? null) ? $data['date_candidates'] : [],
                     ];
 
+                    // ✅ travel_time must stay canonical: {date_from,date_to,date_window,nights}
                     $record->travel_time = $travelTime ?: [
-                        'month_hint'      => $data['month_hint'] ?? ($record->month_hint ?? null),
-                        'date_from'       => $data['date_from'] ?? ($record->date_from ? $record->date_from->toDateString() : null),
-                        'date_to'         => $data['date_to']   ?? ($record->date_to ? $record->date_to->toDateString() : null),
-                        'nights'          => $data['nights'] ?? $record->nights,
-                        'date_window'     => data_get($data, 'date_window') ?? data_get($data, 'travel_time.date_window'),
-                        'date_candidates' => is_array($data['date_candidates'] ?? null) ? $data['date_candidates'] : [],
+                        'date_from'   => $data['date_from'] ?? ($record->date_from ? $record->date_from->toDateString() : null),
+                        'date_to'     => $data['date_to']   ?? ($record->date_to ? $record->date_to->toDateString() : null),
+                        'date_window' => data_get($data, 'travel_time.date_window') ?? null,
+                        'nights'      => $data['nights'] ?? $record->nights,
                     ];
 
+                    // ✅ location_json (this was missing before!)
+                    if ($locationJson !== null) {
+                        $record->location_json = $locationJson;
+                    } elseif (! is_array($record->location_json)) {
+                        // safe fallback so UI can always read it
+                        $bestLoc = $data['location'] ?? $record->location ?? null;
+                        $record->location_json = [
+                            'primary' => filled($bestLoc) ? [['query' => (string) $bestLoc, 'confidence' => null]] : [],
+                            'fallback' => [],
+                            'notes' => null,
+                        ];
+                    }
+
+                    // other canonical fields
                     $record->party        = $party;
                     $record->units        = $units;
                     $record->wishes       = $wishes;
@@ -531,29 +539,67 @@ class ViewInquiry extends ViewRecord
                     $record->tags         = $tags;
                     $record->why_no_offer = $why;
 
+                    // legacy summary: region/location/month_hint
                     foreach (['region','location','month_hint'] as $k) {
                         if (array_key_exists($k, $data) && filled($data[$k])) {
                             $record->{$k} = $data[$k];
                         }
                     }
 
-                    if (! empty($data['date_from'])) $record->date_from = $data['date_from'];
-                    if (! empty($data['date_to']))   $record->date_to   = $data['date_to'];
+                    // legacy dates: prefer explicit legacy keys, otherwise take from canonical travel_time
+                    $legacyDateFrom = $data['date_from'] ?? data_get($record->travel_time, 'date_from');
+                    $legacyDateTo   = $data['date_to']   ?? data_get($record->travel_time, 'date_to');
 
-                    if (array_key_exists('nights', $data) && $data['nights'] !== null) $record->nights = (int) $data['nights'];
-                    if (array_key_exists('adults', $data) && $data['adults'] !== null) $record->adults = (int) $data['adults'];
-                    if (array_key_exists('children', $data) && $data['children'] !== null) $record->children = (int) $data['children'];
+                    if (! empty($legacyDateFrom)) $record->date_from = $legacyDateFrom;
+                    if (! empty($legacyDateTo))   $record->date_to   = $legacyDateTo;
 
+                    // nights: prefer legacy key, else canonical travel_time.nights
+                    if (array_key_exists('nights', $data) && $data['nights'] !== null) {
+                        $record->nights = (int) $data['nights'];
+                    } elseif (data_get($record->travel_time, 'nights') !== null) {
+                        $record->nights = (int) data_get($record->travel_time, 'nights');
+                    }
+
+                    // adults/children: prefer explicit legacy keys, else party totals if present
+                    if (array_key_exists('adults', $data) && $data['adults'] !== null) {
+                        $record->adults = (int) $data['adults'];
+                    } elseif (data_get($record->party, 'adults') !== null) {
+                        $record->adults = (int) data_get($record->party, 'adults');
+                    }
+
+                    if (array_key_exists('children', $data) && $data['children'] !== null) {
+                        $record->children = (int) $data['children'];
+                    } elseif (data_get($record->party, 'children') !== null) {
+                        $record->children = (int) data_get($record->party, 'children');
+                    }
+
+                    // children_ages: prefer legacy key, else party.children_ages
                     if (array_key_exists('children_ages', $data)) {
                         $record->children_ages = InquiryMissingData::normalizeChildrenAges($data['children_ages']);
+                    } elseif (is_array(data_get($record->party, 'children_ages'))) {
+                        $record->children_ages = array_values(data_get($record->party, 'children_ages'));
                     }
 
                     foreach (['budget_min','budget_max'] as $k) {
                         if (array_key_exists($k, $data) && $data[$k] !== null) $record->{$k} = (int) $data[$k];
                     }
 
+                    // ✅ wants_* tri-state: accept true/false/null exactly, do not bool-cast strings blindly
                     foreach (['wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool'] as $k) {
-                        if (array_key_exists($k, $data) && $data[$k] !== null) $record->{$k} = (bool) $data[$k];
+                        if (! array_key_exists($k, $data)) continue;
+
+                        $v = $data[$k];
+                        if ($v === null || $v === '') {
+                            $record->{$k} = null;
+                        } elseif ($v === true || $v === false) {
+                            $record->{$k} = $v;
+                        } elseif (is_numeric($v)) {
+                            $record->{$k} = ((int) $v) === 1 ? true : (((int) $v) === 0 ? false : null);
+                        } elseif (is_string($v)) {
+                            $t = mb_strtolower(trim($v));
+                            if (in_array($t, ['true','da','yes','1'], true)) $record->{$k} = true;
+                            elseif (in_array($t, ['false','ne','no','0'], true)) $record->{$k} = false;
+                        }
                     }
 
                     if (array_key_exists('special_requirements', $data) && filled($data['special_requirements'])) {
@@ -564,6 +610,7 @@ class ViewInquiry extends ViewRecord
                     $record->extraction_mode  = $data['_mode'] ?? ($record->extraction_mode ?? 'fallback');
                     $record->extraction_debug = $data;
 
+                    // if date_from + nights set but date_to missing, derive
                     if ($record->date_from && $record->nights && ! $record->date_to) {
                         try {
                             $record->date_to = Carbon::parse($record->date_from)
@@ -572,7 +619,7 @@ class ViewInquiry extends ViewRecord
                         } catch (\Throwable) {}
                     }
 
-                    // CANONICALIZE party.groups
+                    // --- CANONICALIZE party.groups from units/legacy ---
                     $party = is_array($record->party) ? $record->party : [];
                     $groups = data_get($party, 'groups', []);
                     if (is_string($groups)) {
@@ -617,6 +664,7 @@ class ViewInquiry extends ViewRecord
                     $party['groups'] = $groups;
                     $record->party = $party;
 
+                    // sync totals from groups (this is what UI summary expects)
                     $record->adults = collect($groups)->sum('adults');
                     $record->children = collect($groups)->sum('children');
                     $record->children_ages = collect($groups)->pluck('children_ages')->flatten()->values()->all();
@@ -636,6 +684,7 @@ class ViewInquiry extends ViewRecord
                     $record->processed_at = now();
                     $record->save();
 
+                    // ai_inquiries audit
                     $record->loadMissing('aiInquiry');
                     if ($record->aiInquiry) {
                         /** @var AiInquiry $ai */
@@ -764,6 +813,11 @@ class ViewInquiry extends ViewRecord
                 'log'          => $log,
             ];
             $record->aiInquiry->suggested_at = now();
+
+            // ✅ bitno:
+            $record->aiInquiry->missing_fields = null;
+            $record->aiInquiry->status = \App\Models\AiInquiry::STATUS_SUGGESTED;
+
             $record->aiInquiry->save();
         }
 
@@ -909,6 +963,23 @@ class ViewInquiry extends ViewRecord
                                             ->schema([
                                                 Section::make('Ekstrahovani podaci (summary)')
                                                     ->schema([
+                                                        TextEntry::make('requested_property')
+                                                            ->label('Traženi smeštaj')
+                                                            ->state(function (Inquiry $record) {
+                                                                $pc = data_get($record->entities, 'property_candidates', []);
+                                                                if (!is_array($pc) || empty($pc)) return '-';
+
+                                                                // uzmi prvi kandidat
+                                                                $first = $pc[0] ?? null;
+                                                                if (is_string($first)) return $first;
+
+                                                                $name = data_get($first, 'name')
+                                                                    ?? data_get($first, 'title')
+                                                                    ?? data_get($first, 'query')
+                                                                    ?? null;
+
+                                                                return $name ?: '-';
+                                                            }),
                                                         TextEntry::make('groups_summary')
                                                             ->label('Porodice / grupe')
                                                             ->state(fn (Inquiry $record) => $this->formatGroupsSummary($record))
