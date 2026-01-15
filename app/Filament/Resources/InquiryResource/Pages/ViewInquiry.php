@@ -34,6 +34,7 @@ use Filament\Resources\Pages\ViewRecord;
 use Filament\Support\Enums\MaxWidth;
 use Illuminate\Support\Arr;
 use Illuminate\Support\Facades\Mail;
+use Illuminate\Support\Facades\Schema;
 
 class ViewInquiry extends ViewRecord
 {
@@ -101,6 +102,45 @@ class ViewInquiry extends ViewRecord
     }
 
     /**
+     * ✅ Robust mapping: koja je "naziv" kolona u pt_regions?
+     */
+    private function regionLabelColumn(): string
+    {
+        static $col = null;
+        if ($col) return $col;
+
+        $candidates = ['region', 'title', 'name', 'region_name', 'region_title'];
+
+        foreach ($candidates as $c) {
+            if (Schema::connection('grcka')->hasColumn('pt_regions', $c)) {
+                return $col = $c;
+            }
+        }
+
+        // fallback (ne idealno, ali sprečava crash)
+        return $col = 'region_id';
+    }
+
+    /**
+     * ✅ Robust mapping: koja je "naziv" kolona u pt_locations?
+     */
+    private function locationLabelColumn(): string
+    {
+        static $col = null;
+        if ($col) return $col;
+
+        $candidates = ['location', 'title', 'name', 'location_name', 'location_title'];
+
+        foreach ($candidates as $c) {
+            if (Schema::connection('grcka')->hasColumn('pt_locations', $c)) {
+                return $col = $c;
+            }
+        }
+
+        return $col = 'id';
+    }
+
+    /**
      * SMTP config read via config() (works with config:cache)
      */
     private function resolveSmtpForInbox(string $inbox): array
@@ -136,17 +176,20 @@ class ViewInquiry extends ViewRecord
     /**
      * Helper: pokušaj da iz teksta (Inquiry.region) pogodi region_id
      * - prvo exact, pa like fallback
+     * ✅ koristi realnu kolonu imena (auto-detect)
      */
     private function guessRegionIdFromText(?string $text): ?int
     {
         $text = trim((string) $text);
         if ($text === '') return null;
 
+        $col = $this->regionLabelColumn();
+
         return GrckaRegion::query()
-            ->where('region', $text)
+            ->where($col, $text)
             ->value('region_id')
             ?? GrckaRegion::query()
-                ->where('region', 'like', '%' . $text . '%')
+                ->where($col, 'like', '%' . $text . '%')
                 ->value('region_id');
     }
 
@@ -154,19 +197,22 @@ class ViewInquiry extends ViewRecord
      * Helper: pokušaj da iz teksta (Inquiry.location) pogodi location.id (po nazivu),
      * opcionalno suzi na region_id.
      * - prvo exact, pa like fallback
+     * ✅ koristi realnu kolonu imena (auto-detect)
      */
     private function guessLocationIdFromText(?string $text, ?int $regionId = null): ?int
     {
         $text = trim((string) $text);
         if ($text === '') return null;
 
+        $col = $this->locationLabelColumn();
+
         return GrckaLocation::query()
             ->when($regionId, fn ($q) => $q->where('region_id', $regionId))
-            ->where('location', $text)
+            ->where($col, $text)
             ->value('id')
             ?? GrckaLocation::query()
                 ->when($regionId, fn ($q) => $q->where('region_id', $regionId))
-                ->where('location', 'like', '%' . $text . '%')
+                ->where($col, 'like', '%' . $text . '%')
                 ->value('id');
     }
 
@@ -327,15 +373,17 @@ class ViewInquiry extends ViewRecord
                                     $search = trim($search);
                                     if ($search === '') return [];
 
+                                    $col = $this->regionLabelColumn();
+
                                     return GrckaRegion::query()
-                                        ->where('region', 'like', "%{$search}%")
-                                        ->orderBy('region')
+                                        ->where($col, 'like', "%{$search}%")
+                                        ->orderBy($col)
                                         ->limit(50)
-                                        ->pluck('region', 'region_id')
+                                        ->pluck($col, 'region_id')
                                         ->toArray();
                                 })
                                 ->getOptionLabelUsing(fn ($value): ?string =>
-                                    $value ? GrckaRegion::query()->where('region_id', $value)->value('region') : null
+                                    $value ? GrckaRegion::query()->where('region_id', $value)->value($this->regionLabelColumn()) : null
                                 )
                                 ->afterStateUpdated(function (callable $set) {
                                     // kad se promeni regija, resetuj mesto/hotel
@@ -355,17 +403,18 @@ class ViewInquiry extends ViewRecord
                                     if ($search === '') return [];
 
                                     $regionId = $get('region_id');
+                                    $col = $this->locationLabelColumn();
 
                                     return GrckaLocation::query()
                                         ->when($regionId, fn ($q) => $q->where('region_id', $regionId))
-                                        ->where('location', 'like', "%{$search}%")
-                                        ->orderBy('location')
+                                        ->where($col, 'like', "%{$search}%")
+                                        ->orderBy($col)
                                         ->limit(50)
-                                        ->pluck('location', 'id')
+                                        ->pluck($col, 'id')
                                         ->toArray();
                                 })
                                 ->getOptionLabelUsing(fn ($value): ?string =>
-                                    $value ? GrckaLocation::query()->where('id', $value)->value('location') : null
+                                    $value ? GrckaLocation::query()->where('id', $value)->value($this->locationLabelColumn()) : null
                                 )
                                 ->afterStateUpdated(function (callable $set) {
                                     $set('hotel_id', null);
@@ -391,7 +440,10 @@ class ViewInquiry extends ViewRecord
                                         ->when($locationId, fn ($qq) => $qq->where('hotel_city', (string) $locationId))
                                         // ako nema mesta, a ima region, koristi matchRegion(regionName)
                                         ->when(!$locationId && $regionId, function ($qq) use ($regionId) {
-                                            $regionName = GrckaRegion::query()->where('region_id', $regionId)->value('region');
+                                            $regionName = GrckaRegion::query()
+                                                ->where('region_id', $regionId)
+                                                ->value($this->regionLabelColumn());
+
                                             if ($regionName) {
                                                 $qq->matchRegion($regionName);
                                             }
@@ -1316,12 +1368,18 @@ class ViewInquiry extends ViewRecord
         $hotelId = !empty($data['hotel_id']) ? (int) $data['hotel_id'] : null;
 
         if ($regionId) {
-            $regionName = GrckaRegion::query()->where('region_id', $regionId)->value('region');
+            $regionName = GrckaRegion::query()
+                ->where('region_id', $regionId)
+                ->value($this->regionLabelColumn());
+
             if ($regionName) $data['region'] = $regionName;
         }
 
         if ($locationId) {
-            $locName = GrckaLocation::query()->where('id', $locationId)->value('location');
+            $locName = GrckaLocation::query()
+                ->where('id', $locationId)
+                ->value($this->locationLabelColumn());
+
             if ($locName) $data['location'] = $locName;
         }
 
