@@ -6,6 +6,9 @@ use App\Filament\Resources\InquiryResource;
 use App\Mail\InquiryDraftMail;
 use App\Models\AiInquiry;
 use App\Models\Inquiry;
+use App\Models\Grcka\Hotel as GrckaHotel;
+use App\Models\Grcka\Location as GrckaLocation;
+use App\Models\Grcka\Region as GrckaRegion;
 use App\Services\InquiryAccommodationMatcher;
 use App\Services\InquiryAiExtractor;
 use App\Services\InquiryMissingData;
@@ -13,6 +16,7 @@ use App\Services\InquiryOfferDraftBuilder;
 use Carbon\Carbon;
 use Filament\Actions;
 use Filament\Forms\Components\DatePicker;
+use Filament\Forms\Components\Grid as FormGrid;
 use Filament\Forms\Components\Hidden;
 use Filament\Forms\Components\Repeater;
 use Filament\Forms\Components\Select;
@@ -89,13 +93,8 @@ class ViewInquiry extends ViewRecord
     {
         $s = (string) ($value ?? '');
 
-        // unify newlines
         $s = str_replace(["\r\n", "\r"], "\n", $s);
-
-        // remove trailing spaces before newline
         $s = preg_replace("/[ \t]+\n/", "\n", $s) ?? $s;
-
-        // collapse 3+ empty lines -> max 2
         $s = preg_replace("/\n{3,}/", "\n\n", $s) ?? $s;
 
         return trim($s);
@@ -134,6 +133,43 @@ class ViewInquiry extends ViewRecord
         ];
     }
 
+    /**
+     * Helper: pokušaj da iz teksta (Inquiry.region) pogodi region_id
+     * - prvo exact, pa like fallback
+     */
+    private function guessRegionIdFromText(?string $text): ?int
+    {
+        $text = trim((string) $text);
+        if ($text === '') return null;
+
+        return GrckaRegion::query()
+            ->where('region', $text)
+            ->value('region_id')
+            ?? GrckaRegion::query()
+                ->where('region', 'like', '%' . $text . '%')
+                ->value('region_id');
+    }
+
+    /**
+     * Helper: pokušaj da iz teksta (Inquiry.location) pogodi location.id (po nazivu),
+     * opcionalno suzi na region_id.
+     * - prvo exact, pa like fallback
+     */
+    private function guessLocationIdFromText(?string $text, ?int $regionId = null): ?int
+    {
+        $text = trim((string) $text);
+        if ($text === '') return null;
+
+        return GrckaLocation::query()
+            ->when($regionId, fn ($q) => $q->where('region_id', $regionId))
+            ->where('location', $text)
+            ->value('id')
+            ?? GrckaLocation::query()
+                ->when($regionId, fn ($q) => $q->where('region_id', $regionId))
+                ->where('location', 'like', '%' . $text . '%')
+                ->value('id');
+    }
+
     protected function getHeaderActions(): array
     {
         $triStateOptions = [
@@ -150,7 +186,7 @@ class ViewInquiry extends ViewRecord
                 ->visible(fn () =>
                     filled($this->record->guest_email) &&
                     filled($this->record->ai_draft) &&
-                    in_array((string) $this->record->status, ['needs_info', 'extracted', 'suggested', 'no_ai'], true)
+                    in_array((string) $this->record->status, ['new', 'needs_info', 'extracted', 'suggested', 'no_ai'], true)
                 )
                 ->fillForm(function () {
                     /** @var Inquiry $record */
@@ -264,153 +300,188 @@ class ViewInquiry extends ViewRecord
                         ->send();
                 }),
 
-            Actions\Action::make('quick_edit')
-                ->label('Quick edit')
+            /**
+             * JEDNA EDIT AKCIJA (single + multi)
+             * + dropdown regija/mesto/hotel iz GRCKA baze sa live search
+             * - NE MENJA matcher (i dalje se cuva tekst region/location)
+             */
+            Actions\Action::make('edit_search')
+                ->label('Edit (search params)')
                 ->icon('heroicon-o-pencil-square')
                 ->color('warning')
-                ->visible(fn () => $this->isSingle($this->record))
-                ->fillForm(fn () => $this->prefillQuickEditForm($this->record))
+                ->visible(fn () => true)
+                ->fillForm(fn () => $this->prefillEditSearchForm($this->record))
                 ->form([
-                    TextInput::make('region')->label('Regija')->maxLength(255),
-                    TextInput::make('location')->label('Mesto')->maxLength(255),
-                    TextInput::make('month_hint')->label('Okvirni period')->maxLength(255),
-
-                    DatePicker::make('date_from')->label('Datum od'),
-                    DatePicker::make('date_to')->label('Datum do'),
-
-                    TextInput::make('nights')->label('Broj noćenja')->numeric()->minValue(0),
-                    TextInput::make('adults')->label('Odrasli')->numeric()->minValue(0),
-                    TextInput::make('children')->label('Deca')->numeric()->minValue(0),
-
-                    TextInput::make('children_ages')
-                        ->label('Uzrast dece (npr: 5 ili 5, 8)')
-                        ->helperText('Ako ima dece, uzrast je obavezan da bismo dali ponudu (1:1 zahtev).')
-                        ->maxLength(255),
-
-                    TextInput::make('budget_min')->label('Budžet min (€)')->numeric()->minValue(0),
-                    TextInput::make('budget_max')->label('Budžet max (€)')->numeric()->minValue(0),
-
-                    Select::make('wants_near_beach')->label('Blizu plaže')->options($triStateOptions)->native(false),
-                    Select::make('wants_parking')->label('Parking')->options($triStateOptions)->native(false),
-                    Select::make('wants_quiet')->label('Mirna lokacija')->options($triStateOptions)->native(false),
-                    Select::make('wants_pets')->label('Ljubimci')->options($triStateOptions)->native(false),
-                    Select::make('wants_pool')->label('Bazen')->options($triStateOptions)->native(false),
-
-                    Textarea::make('special_requirements')->label('Napomena / dodatni zahtevi')->rows(3),
-
-                    Select::make('reply_mode')
-                        ->label('Način odgovora')
-                        ->options([
-                            'ai_draft' => 'AI draft',
-                            'manual'   => 'Ručni',
-                        ])
-                        ->required(),
-
-                    Select::make('status')
-                        ->label('Status')
-                        ->options([
-                            'new'        => 'New',
-                            'needs_info' => 'Needs info',
-                            'extracted'  => 'Extracted',
-                            'suggested'  => 'Suggested',
-                            'replied'    => 'Replied',
-                            'closed'     => 'Closed',
-                            'no_ai'      => 'Bez AI obrade',
-                        ])
-                        ->required(),
-                ])
-                ->action(function (array $data) {
-                    /** @var Inquiry $record */
-                    $record = $this->record;
-
-                    $data['children_ages'] = InquiryMissingData::normalizeChildrenAges($data['children_ages'] ?? null);
-
-                    foreach (['wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool'] as $k) {
-                        if (! array_key_exists($k, $data)) continue;
-                        $v = $data[$k];
-                        if ($v === '' || $v === null) $data[$k] = null;
-                        elseif ((string) $v === '1') $data[$k] = true;
-                        elseif ((string) $v === '0') $data[$k] = false;
-                    }
-
-                    $children = isset($data['children']) ? (int) $data['children'] : null;
-                    if ($children !== null && $children > 0 && empty($data['children_ages'])) {
-                        Notification::make()
-                            ->title('Nedostaje uzrast dece')
-                            ->body('Ako ima dece, uzrast je potreban da bismo dali ponudu.')
-                            ->warning()
-                            ->send();
-                        return;
-                    }
-
-                    $record->fill(Arr::only($data, [
-                        'region','location','month_hint',
-                        'date_from','date_to','nights',
-                        'adults','children','children_ages',
-                        'budget_min','budget_max',
-                        'wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool',
-                        'special_requirements',
-                        'reply_mode','status',
-                    ]));
-
-                    $party = is_array($record->party) ? $record->party : [];
-                    $party['groups'] = [[
-                        'adults'        => (int) ($record->adults ?? 0),
-                        'children'      => (int) ($record->children ?? 0),
-                        'children_ages' => is_array($record->children_ages)
-                            ? array_values($record->children_ages)
-                            : (InquiryMissingData::normalizeChildrenAges($record->children_ages) ?? []),
-                        'requirements'  => [],
-                    ]];
-                    $record->party = $party;
-
-                    $record->processed_at = now();
-                    $record->save();
-
-                    $this->refreshRecord();
-
-                    $missing = InquiryMissingData::detect($this->record);
-
-                    Notification::make()
-                        ->title('Sačuvano')
-                        ->body(empty($missing)
-                            ? 'Sada ima dovoljno podataka za generisanje ponude.'
-                            : 'I dalje nedostaje: ' . implode('; ', $missing)
-                        )
-                        ->success()
-                        ->send();
-                }),
-
-            Actions\Action::make('edit_groups')
-                ->label('Edit groups')
-                ->icon('heroicon-o-user-group')
-                ->color('warning')
-                ->visible(fn () => $this->isMulti($this->record))
-                ->fillForm(function () {
-                    $groups = data_get($this->record, 'party.groups', []);
-                    if (is_string($groups)) {
-                        $decoded = json_decode($groups, true);
-                        $groups = is_array($decoded) ? $decoded : [];
-                    }
-                    $groups = is_array($groups) ? $groups : [];
-
-                    $groups = collect($groups)->map(function ($g) {
-                        $g = is_array($g) ? $g : [];
-                        $ages = data_get($g, 'children_ages', []);
-                        if (is_array($ages)) $g['children_ages'] = implode(', ', $ages);
-                        $req = data_get($g, 'requirements', []);
-                        if (is_array($req)) $g['requirements'] = implode("\n", $req);
-                        return $g;
-                    })->values()->all();
-
-                    return ['groups' => $groups];
-                })
-                ->form([
-                    Repeater::make('groups')
-                        ->label('Porodice')
+                    FormGrid::make()
+                        ->columns(['default' => 1, 'lg' => 2])
                         ->schema([
-                            TextInput::make('adults')->numeric()->minValue(0)->required(),
-                            TextInput::make('children')->numeric()->minValue(0)->default(0),
+
+                            // -------- REGIJA (pt_regions) --------
+                            Select::make('region_id')
+                                ->label('Regija (iz baze)')
+                                ->searchable()
+                                ->preload(false)
+                                ->reactive()
+                                ->placeholder('Kucaj regiju...')
+                                ->getSearchResultsUsing(function (string $search): array {
+                                    $search = trim($search);
+                                    if ($search === '') return [];
+
+                                    return GrckaRegion::query()
+                                        ->where('region', 'like', "%{$search}%")
+                                        ->orderBy('region')
+                                        ->limit(50)
+                                        ->pluck('region', 'region_id')
+                                        ->toArray();
+                                })
+                                ->getOptionLabelUsing(fn ($value): ?string =>
+                                    $value ? GrckaRegion::query()->where('region_id', $value)->value('region') : null
+                                )
+                                ->afterStateUpdated(function (callable $set) {
+                                    // kad se promeni regija, resetuj mesto/hotel
+                                    $set('location_id', null);
+                                    $set('hotel_id', null);
+                                }),
+
+                            // -------- MESTO (pt_locations) --------
+                            Select::make('location_id')
+                                ->label('Mesto (iz baze)')
+                                ->searchable()
+                                ->preload(false)
+                                ->reactive()
+                                ->placeholder('Kucaj mesto...')
+                                ->getSearchResultsUsing(function (callable $get, string $search): array {
+                                    $search = trim($search);
+                                    if ($search === '') return [];
+
+                                    $regionId = $get('region_id');
+
+                                    return GrckaLocation::query()
+                                        ->when($regionId, fn ($q) => $q->where('region_id', $regionId))
+                                        ->where('location', 'like', "%{$search}%")
+                                        ->orderBy('location')
+                                        ->limit(50)
+                                        ->pluck('location', 'id')
+                                        ->toArray();
+                                })
+                                ->getOptionLabelUsing(fn ($value): ?string =>
+                                    $value ? GrckaLocation::query()->where('id', $value)->value('location') : null
+                                )
+                                ->afterStateUpdated(function (callable $set) {
+                                    $set('hotel_id', null);
+                                }),
+
+                            // -------- HOTEL (pt_hotels) --------
+                            Select::make('hotel_id')
+                                ->label('Hotel (iz baze)')
+                                ->searchable()
+                                ->preload(false)
+                                ->placeholder('Kucaj hotel...')
+                                ->helperText('Pretraga je ograničena na AI-eligible hotele.')
+                                ->getSearchResultsUsing(function (callable $get, string $search): array {
+                                    $search = trim($search);
+                                    if ($search === '') return [];
+
+                                    $locationId = $get('location_id');
+                                    $regionId   = $get('region_id');
+
+                                    $q = GrckaHotel::query()
+                                        ->aiEligible()
+                                        // suzi po mestu (hotel_city je kod tebe string ID lokacije)
+                                        ->when($locationId, fn ($qq) => $qq->where('hotel_city', (string) $locationId))
+                                        // ako nema mesta, a ima region, koristi matchRegion(regionName)
+                                        ->when(!$locationId && $regionId, function ($qq) use ($regionId) {
+                                            $regionName = GrckaRegion::query()->where('region_id', $regionId)->value('region');
+                                            if ($regionName) {
+                                                $qq->matchRegion($regionName);
+                                            }
+                                        })
+                                        // ✅ samo realne kolone
+                                        ->where(function ($qq) use ($search) {
+                                            $qq->where('hotel_title', 'like', "%{$search}%")
+                                                ->orWhere('custom_name', 'like', "%{$search}%")
+                                                ->orWhere('api_name', 'like', "%{$search}%")
+                                                ->orWhere('hotel_slug', 'like', "%{$search}%");
+                                        })
+                                        ->limit(50);
+
+                                    return $q->get(['hotel_id', 'hotel_title', 'custom_name', 'api_name'])
+                                        ->mapWithKeys(function ($h) {
+                                            $label = (string) ($h->hotel_title ?: $h->custom_name ?: $h->api_name ?: ('Hotel #' . $h->hotel_id));
+                                            return [(int) $h->hotel_id => $label];
+                                        })
+                                        ->toArray();
+                                })
+                                ->getOptionLabelUsing(function ($value): ?string {
+                                    if (! $value) return null;
+
+                                    $h = GrckaHotel::query()
+                                        ->where('hotel_id', (int) $value)
+                                        ->first(['hotel_id', 'hotel_title', 'custom_name', 'api_name']);
+
+                                    if (! $h) return null;
+
+                                    return (string) ($h->hotel_title ?: $h->custom_name ?: $h->api_name ?: ('Hotel #' . $h->hotel_id));
+                                }),
+
+                            // ✅ tekst polja su fallback, ali disable-ovana kad postoji izbor iz baze (da ne dođe do konflikta)
+                            TextInput::make('region')
+                                ->label('Regija (tekst)')
+                                ->maxLength(255)
+                                ->disabled(fn (callable $get) => filled($get('region_id')))
+                                ->helperText('Može ručno, ali ako izabereš regiju iz baze – ovo se zaključava.'),
+
+                            TextInput::make('location')
+                                ->label('Mesto (tekst)')
+                                ->maxLength(255)
+                                ->disabled(fn (callable $get) => filled($get('location_id')))
+                                ->helperText('Može ručno, ali ako izabereš mesto iz baze – ovo se zaključava.'),
+
+                            TextInput::make('month_hint')->label('Okvirni period')->maxLength(255),
+
+                            DatePicker::make('date_from')->label('Datum od'),
+                            DatePicker::make('date_to')->label('Datum do'),
+
+                            TextInput::make('nights')->label('Broj noćenja')->numeric()->minValue(0),
+
+                            TextInput::make('budget_min')->label('Budžet min (€)')->numeric()->minValue(0),
+                            TextInput::make('budget_max')->label('Budžet max (€)')->numeric()->minValue(0),
+
+                            Select::make('wants_near_beach')->label('Blizu plaže')->options($triStateOptions)->native(false),
+                            Select::make('wants_parking')->label('Parking')->options($triStateOptions)->native(false),
+                            Select::make('wants_quiet')->label('Mirna lokacija')->options($triStateOptions)->native(false),
+                            Select::make('wants_pets')->label('Ljubimci')->options($triStateOptions)->native(false),
+                            Select::make('wants_pool')->label('Bazen')->options($triStateOptions)->native(false),
+
+                            Textarea::make('special_requirements')->label('Napomena / dodatni zahtevi')->rows(3)->columnSpanFull(),
+
+                            Select::make('reply_mode')
+                                ->label('Način odgovora')
+                                ->options([
+                                    'ai_draft' => 'AI draft',
+                                    'manual'   => 'Ručni',
+                                ])
+                                ->required(),
+
+                            Select::make('status')
+                                ->label('Status')
+                                ->options([
+                                    'new'        => 'New',
+                                    'needs_info' => 'Needs info',
+                                    'extracted'  => 'Extracted',
+                                    'suggested'  => 'Suggested',
+                                    'replied'    => 'Replied',
+                                    'closed'     => 'Closed',
+                                    'no_ai'      => 'Bez AI obrade',
+                                ])
+                                ->required(),
+                        ]),
+
+                    Repeater::make('groups')
+                        ->label('Porodice / grupe')
+                        ->schema([
+                            TextInput::make('adults')->label('Odrasli')->numeric()->minValue(0)->required(),
+                            TextInput::make('children')->label('Deca')->numeric()->minValue(0)->default(0),
 
                             TextInput::make('children_ages')
                                 ->label('Uzrast dece (npr: 8, 5)')
@@ -422,53 +493,11 @@ class ViewInquiry extends ViewRecord
                                 ->helperText('Npr: odvojena soba, mirno, parking...'),
                         ])
                         ->columns(2)
-                        ->minItems(2)
-                        ->reorderable(false),
+                        ->minItems(1)
+                        ->reorderable(false)
+                        ->columnSpanFull(),
                 ])
-                ->action(function (array $data) {
-                    /** @var Inquiry $record */
-                    $record = $this->record;
-
-                    $groups = $data['groups'] ?? [];
-                    $groups = is_array($groups) ? $groups : [];
-
-                    $groups = collect($groups)->map(function ($g) {
-                        $g = is_array($g) ? $g : [];
-                        $g['adults'] = (int) ($g['adults'] ?? 0);
-                        $g['children'] = (int) ($g['children'] ?? 0);
-
-                        $g['children_ages'] = InquiryMissingData::normalizeChildrenAges($g['children_ages'] ?? null) ?? [];
-
-                        $lines = preg_split("/\r\n|\n|\r/", (string) ($g['requirements'] ?? '')) ?: [];
-                        $g['requirements'] = array_values(array_filter(array_map('trim', $lines)));
-
-                        return $g;
-                    })->values()->all();
-
-                    $party = is_array($record->party) ? $record->party : [];
-                    $party['groups'] = $groups;
-                    $record->party = $party;
-
-                    $record->adults = collect($groups)->sum('adults');
-                    $record->children = collect($groups)->sum('children');
-                    $record->children_ages = collect($groups)->pluck('children_ages')->flatten()->values()->all();
-
-                    $record->processed_at = now();
-                    $record->save();
-
-                    $this->refreshRecord();
-
-                    $missing = InquiryMissingData::detect($this->record);
-
-                    Notification::make()
-                        ->title('Sačuvano')
-                        ->body(empty($missing)
-                            ? 'Sada ima dovoljno podataka za generisanje ponude.'
-                            : 'I dalje nedostaje: ' . implode('; ', $missing)
-                        )
-                        ->success()
-                        ->send();
-                }),
+                ->action(fn (array $data) => $this->saveEditSearchForm($data)),
 
             Actions\Action::make('run_ai_extraction')
                 ->label('Run extraction')
@@ -486,7 +515,6 @@ class ViewInquiry extends ViewRecord
                     $extractor = app(InquiryAiExtractor::class);
                     $data = $extractor->extract($record);
 
-                    // --- canonical payloads (stable shapes) ---
                     $entities   = is_array($data['entities'] ?? null) ? $data['entities'] : null;
                     $travelTime = is_array($data['travel_time'] ?? null) ? $data['travel_time'] : null;
                     $party      = is_array($data['party'] ?? null) ? $data['party'] : [];
@@ -497,12 +525,10 @@ class ViewInquiry extends ViewRecord
                     $why        = is_array($data['why_no_offer'] ?? null) ? $data['why_no_offer'] : [];
                     $locationJson = is_array($data['location_json'] ?? null) ? $data['location_json'] : null;
 
-                    // intent
                     if (array_key_exists('intent', $data) && filled($data['intent'])) {
                         $record->intent = (string) $data['intent'];
                     }
 
-                    // entities (fallback to legacy keys if needed)
                     $record->entities = $entities ?: [
                         'property_candidates' => is_array($data['property_candidates'] ?? null) ? $data['property_candidates'] : [],
                         'location_candidates' => is_array($data['location_candidates'] ?? null) ? $data['location_candidates'] : [],
@@ -510,7 +536,6 @@ class ViewInquiry extends ViewRecord
                         'date_candidates'     => is_array($data['date_candidates'] ?? null) ? $data['date_candidates'] : [],
                     ];
 
-                    // ✅ travel_time must stay canonical: {date_from,date_to,date_window,nights}
                     $record->travel_time = $travelTime ?: [
                         'date_from'   => $data['date_from'] ?? ($record->date_from ? $record->date_from->toDateString() : null),
                         'date_to'     => $data['date_to']   ?? ($record->date_to ? $record->date_to->toDateString() : null),
@@ -518,11 +543,9 @@ class ViewInquiry extends ViewRecord
                         'nights'      => $data['nights'] ?? $record->nights,
                     ];
 
-                    // ✅ location_json (this was missing before!)
                     if ($locationJson !== null) {
                         $record->location_json = $locationJson;
                     } elseif (! is_array($record->location_json)) {
-                        // safe fallback so UI can always read it
                         $bestLoc = $data['location'] ?? $record->location ?? null;
                         $record->location_json = [
                             'primary' => filled($bestLoc) ? [['query' => (string) $bestLoc, 'confidence' => null]] : [],
@@ -531,7 +554,6 @@ class ViewInquiry extends ViewRecord
                         ];
                     }
 
-                    // other canonical fields
                     $record->party        = $party;
                     $record->units        = $units;
                     $record->wishes       = $wishes;
@@ -539,28 +561,24 @@ class ViewInquiry extends ViewRecord
                     $record->tags         = $tags;
                     $record->why_no_offer = $why;
 
-                    // legacy summary: region/location/month_hint
                     foreach (['region','location','month_hint'] as $k) {
                         if (array_key_exists($k, $data) && filled($data[$k])) {
                             $record->{$k} = $data[$k];
                         }
                     }
 
-                    // legacy dates: prefer explicit legacy keys, otherwise take from canonical travel_time
                     $legacyDateFrom = $data['date_from'] ?? data_get($record->travel_time, 'date_from');
                     $legacyDateTo   = $data['date_to']   ?? data_get($record->travel_time, 'date_to');
 
                     if (! empty($legacyDateFrom)) $record->date_from = $legacyDateFrom;
                     if (! empty($legacyDateTo))   $record->date_to   = $legacyDateTo;
 
-                    // nights: prefer legacy key, else canonical travel_time.nights
                     if (array_key_exists('nights', $data) && $data['nights'] !== null) {
                         $record->nights = (int) $data['nights'];
                     } elseif (data_get($record->travel_time, 'nights') !== null) {
                         $record->nights = (int) data_get($record->travel_time, 'nights');
                     }
 
-                    // adults/children: prefer explicit legacy keys, else party totals if present
                     if (array_key_exists('adults', $data) && $data['adults'] !== null) {
                         $record->adults = (int) $data['adults'];
                     } elseif (data_get($record->party, 'adults') !== null) {
@@ -573,7 +591,6 @@ class ViewInquiry extends ViewRecord
                         $record->children = (int) data_get($record->party, 'children');
                     }
 
-                    // children_ages: prefer legacy key, else party.children_ages
                     if (array_key_exists('children_ages', $data)) {
                         $record->children_ages = InquiryMissingData::normalizeChildrenAges($data['children_ages']);
                     } elseif (is_array(data_get($record->party, 'children_ages'))) {
@@ -584,7 +601,6 @@ class ViewInquiry extends ViewRecord
                         if (array_key_exists($k, $data) && $data[$k] !== null) $record->{$k} = (int) $data[$k];
                     }
 
-                    // ✅ wants_* tri-state: accept true/false/null exactly, do not bool-cast strings blindly
                     foreach (['wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool'] as $k) {
                         if (! array_key_exists($k, $data)) continue;
 
@@ -610,7 +626,6 @@ class ViewInquiry extends ViewRecord
                     $record->extraction_mode  = $data['_mode'] ?? ($record->extraction_mode ?? 'fallback');
                     $record->extraction_debug = $data;
 
-                    // if date_from + nights set but date_to missing, derive
                     if ($record->date_from && $record->nights && ! $record->date_to) {
                         try {
                             $record->date_to = Carbon::parse($record->date_from)
@@ -619,7 +634,6 @@ class ViewInquiry extends ViewRecord
                         } catch (\Throwable) {}
                     }
 
-                    // --- CANONICALIZE party.groups from units/legacy ---
                     $party = is_array($record->party) ? $record->party : [];
                     $groups = data_get($party, 'groups', []);
                     if (is_string($groups)) {
@@ -664,7 +678,6 @@ class ViewInquiry extends ViewRecord
                     $party['groups'] = $groups;
                     $record->party = $party;
 
-                    // sync totals from groups (this is what UI summary expects)
                     $record->adults = collect($groups)->sum('adults');
                     $record->children = collect($groups)->sum('children');
                     $record->children_ages = collect($groups)->pluck('children_ages')->flatten()->values()->all();
@@ -684,7 +697,6 @@ class ViewInquiry extends ViewRecord
                     $record->processed_at = now();
                     $record->save();
 
-                    // ai_inquiries audit
                     $record->loadMissing('aiInquiry');
                     if ($record->aiInquiry) {
                         /** @var AiInquiry $ai */
@@ -814,7 +826,6 @@ class ViewInquiry extends ViewRecord
             ];
             $record->aiInquiry->suggested_at = now();
 
-            // ✅ bitno:
             $record->aiInquiry->missing_fields = null;
             $record->aiInquiry->status = \App\Models\AiInquiry::STATUS_SUGGESTED;
 
@@ -828,7 +839,8 @@ class ViewInquiry extends ViewRecord
                 $title =
                     data_get($c, 'title')
                     ?? data_get($hotel, 'hotel_title')
-                    ?? data_get($hotel, 'title')
+                    ?? data_get($hotel, 'custom_name')
+                    ?? data_get($hotel, 'api_name')
                     ?? 'Smeštaj';
 
                 $url = data_get($hotel, 'public_url')
@@ -969,7 +981,6 @@ class ViewInquiry extends ViewRecord
                                                                 $pc = data_get($record->entities, 'property_candidates', []);
                                                                 if (!is_array($pc) || empty($pc)) return '-';
 
-                                                                // uzmi prvi kandidat
                                                                 $first = $pc[0] ?? null;
                                                                 if (is_string($first)) return $first;
 
@@ -980,6 +991,7 @@ class ViewInquiry extends ViewRecord
 
                                                                 return $name ?: '-';
                                                             }),
+
                                                         TextEntry::make('groups_summary')
                                                             ->label('Porodice / grupe')
                                                             ->state(fn (Inquiry $record) => $this->formatGroupsSummary($record))
@@ -1091,7 +1103,6 @@ class ViewInquiry extends ViewRecord
                                                                     ]),
                                                                 TextEntry::make('special_requirements')->label('Napomena')->default('-')->columnSpanFull(),
                                                             ]),
-
                                                     ]),
 
                                                 Section::make('AI Audit (ai_inquiries)')
@@ -1178,20 +1189,60 @@ class ViewInquiry extends ViewRecord
         })->implode("\n");
     }
 
-    private function prefillQuickEditForm(Inquiry $i): array
+    /**
+     * Prefill za unified edit:
+     * - doda region_id/location_id iz teksta ako može
+     * - doda hotel_id = null (ne pretpostavljamo)
+     * - groups min 1
+     */
+    private function prefillEditSearchForm(Inquiry $i): array
     {
         $toSelect = fn ($v) => $v === null ? '' : ($v ? '1' : '0');
 
+        $regionId = $this->guessRegionIdFromText($i->region);
+        $locationId = $this->guessLocationIdFromText($i->location, $regionId);
+
+        $groups = data_get($i, 'party.groups', []);
+        if (is_string($groups)) {
+            $decoded = json_decode($groups, true);
+            $groups = is_array($decoded) ? $decoded : [];
+        }
+        $groups = is_array($groups) ? $groups : [];
+
+        if (count($groups) === 0) {
+            $groups = [[
+                'adults'        => (int) ($i->adults ?? 0),
+                'children'      => (int) ($i->children ?? 0),
+                'children_ages' => is_array($i->children_ages) ? implode(', ', $i->children_ages) : (string) ($i->children_ages ?? ''),
+                'requirements'  => '',
+            ]];
+        } else {
+            $groups = collect($groups)->map(function ($g) {
+                $g = is_array($g) ? $g : [];
+                $ages = data_get($g, 'children_ages', []);
+                $req  = data_get($g, 'requirements', []);
+
+                return [
+                    'adults'        => (int) data_get($g, 'adults', 0),
+                    'children'      => (int) data_get($g, 'children', 0),
+                    'children_ages' => is_array($ages) ? implode(', ', $ages) : (string) ($ages ?? ''),
+                    'requirements'  => is_array($req) ? implode("\n", $req) : (string) ($req ?? ''),
+                ];
+            })->values()->all();
+        }
+
         return [
+            'region_id'   => $regionId,
+            'location_id' => $locationId,
+            'hotel_id'    => null,
+
             'region' => $i->region,
             'location' => $i->location,
             'month_hint' => $i->month_hint,
             'date_from' => $i->date_from,
             'date_to' => $i->date_to,
             'nights' => $i->nights,
-            'adults' => $i->adults,
-            'children' => $i->children,
-            'children_ages' => is_array($i->children_ages) ? implode(', ', $i->children_ages) : $i->children_ages,
+
             'budget_min' => $i->budget_min,
             'budget_max' => $i->budget_max,
 
@@ -1204,7 +1255,137 @@ class ViewInquiry extends ViewRecord
             'special_requirements' => $i->special_requirements,
             'reply_mode' => $i->reply_mode,
             'status' => $i->status,
+
+            'groups' => $groups,
         ];
+    }
+
+    /**
+     * Save unified edit:
+     * - tri-state wants_*
+     * - normalize groups + validation (if children > 0 -> ages required)
+     * - upiše region/location iz dropdown-a ako izabrano
+     * - ako izabran hotel, ubaci u entities.property_candidates[0]
+     */
+    private function saveEditSearchForm(array $data): void
+    {
+        /** @var Inquiry $record */
+        $record = $this->record;
+
+        foreach (['wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool'] as $k) {
+            if (! array_key_exists($k, $data)) continue;
+            $v = $data[$k];
+            if ($v === '' || $v === null) $data[$k] = null;
+            elseif ((string) $v === '1') $data[$k] = true;
+            elseif ((string) $v === '0') $data[$k] = false;
+        }
+
+        $groups = $data['groups'] ?? [];
+        $groups = is_array($groups) ? $groups : [];
+
+        $groups = collect($groups)->map(function ($g) {
+            $g = is_array($g) ? $g : [];
+
+            $g['adults'] = (int) ($g['adults'] ?? 0);
+            $g['children'] = (int) ($g['children'] ?? 0);
+
+            $g['children_ages'] = InquiryMissingData::normalizeChildrenAges($g['children_ages'] ?? null) ?? [];
+
+            $lines = preg_split("/\r\n|\n|\r/", (string) ($g['requirements'] ?? '')) ?: [];
+            $g['requirements'] = array_values(array_filter(array_map('trim', $lines)));
+
+            return $g;
+        })->values()->all();
+
+        foreach ($groups as $idx => $g) {
+            $c = (int) ($g['children'] ?? 0);
+            $ages = $g['children_ages'] ?? [];
+            if ($c > 0 && (! is_array($ages) || count($ages) === 0)) {
+                Notification::make()
+                    ->title('Nedostaje uzrast dece')
+                    ->body('Porodica ' . ($idx + 1) . ': ima dece, ali uzrast nije upisan.')
+                    ->warning()
+                    ->send();
+                return;
+            }
+        }
+
+        // region/location from dropdown (if selected)
+        $regionId = !empty($data['region_id']) ? (int) $data['region_id'] : null;
+        $locationId = !empty($data['location_id']) ? (int) $data['location_id'] : null;
+        $hotelId = !empty($data['hotel_id']) ? (int) $data['hotel_id'] : null;
+
+        if ($regionId) {
+            $regionName = GrckaRegion::query()->where('region_id', $regionId)->value('region');
+            if ($regionName) $data['region'] = $regionName;
+        }
+
+        if ($locationId) {
+            $locName = GrckaLocation::query()->where('id', $locationId)->value('location');
+            if ($locName) $data['location'] = $locName;
+        }
+
+        $record->fill(Arr::only($data, [
+            'region','location','month_hint',
+            'date_from','date_to','nights',
+            'budget_min','budget_max',
+            'wants_near_beach','wants_parking','wants_quiet','wants_pets','wants_pool',
+            'special_requirements',
+            'reply_mode','status',
+        ]));
+
+        // hotel selection -> entities.property_candidates[0]
+        if ($hotelId) {
+            $hotel = GrckaHotel::query()
+                ->where('hotel_id', $hotelId)
+                ->first(['hotel_id', 'hotel_title', 'custom_name', 'api_name', 'hotel_slug']);
+
+            if ($hotel) {
+                $entities = is_array($record->entities) ? $record->entities : [];
+                $pc = is_array(data_get($entities, 'property_candidates')) ? data_get($entities, 'property_candidates') : [];
+
+                array_unshift($pc, [
+                    'name'       => (string) ($hotel->hotel_title ?: $hotel->custom_name ?: $hotel->api_name ?: 'Hotel'),
+                    'hotel_id'   => (int) $hotel->hotel_id,
+                    'hotel_slug' => $hotel->hotel_slug ?? null,
+                    'confidence' => 1.0,
+                    'source'     => 'manual_select',
+                ]);
+
+                // dedupe by hotel_id
+                $pc = collect($pc)
+                    ->unique(fn ($x) => is_array($x) ? (data_get($x, 'hotel_id') ?? json_encode($x)) : (string) $x)
+                    ->values()
+                    ->all();
+
+                $entities['property_candidates'] = $pc;
+                $record->entities = $entities;
+            }
+        }
+
+        $party = is_array($record->party) ? $record->party : [];
+        $party['groups'] = $groups;
+        $record->party = $party;
+
+        $record->adults = collect($groups)->sum('adults');
+        $record->children = collect($groups)->sum('children');
+        $record->children_ages = collect($groups)->pluck('children_ages')->flatten()->values()->all();
+
+        $record->processed_at = now();
+        $record->save();
+
+        $this->refreshRecord();
+
+        $missing = InquiryMissingData::detect($this->record);
+
+        Notification::make()
+            ->title('Sačuvano')
+            ->body(empty($missing)
+                ? 'Sada ima dovoljno podataka za generisanje ponude.'
+                : 'I dalje nedostaje: ' . implode('; ', $missing)
+            )
+            ->success()
+            ->send();
     }
 
     private function prettyJson($state): string

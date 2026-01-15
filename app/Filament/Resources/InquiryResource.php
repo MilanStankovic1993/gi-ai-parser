@@ -82,7 +82,7 @@ class InquiryResource extends Resource
                         ->numeric()
                         ->minValue(0),
 
-                    // ✅ SOURCE OF TRUTH: InquiryMissingData::normalizeChildrenAges (NE unique, 1-17)
+                    // SOURCE OF TRUTH: InquiryMissingData::normalizeChildrenAges (NE unique, 1-17)
                     \Filament\Forms\Components\TextInput::make('children_ages')
                         ->label('Uzrast dece (npr: 5 ili 5, 8)')
                         ->maxLength(255)
@@ -243,7 +243,7 @@ class InquiryResource extends Resource
             ->actions([
                 Tables\Actions\ViewAction::make()->label('Open')->icon('heroicon-o-eye'),
 
-                // ✅ Quick edit modal
+                // Quick edit modal
                 Tables\Actions\EditAction::make()
                     ->label('Quick edit')
                     ->icon('heroicon-o-pencil-square')
@@ -264,7 +264,7 @@ class InquiryResource extends Resource
                         return $data;
                     }),
 
-                // ✅ Row delete
+                // Row delete
                 Tables\Actions\DeleteAction::make()
                     ->label('Delete')
                     ->icon('heroicon-o-trash')
@@ -272,7 +272,7 @@ class InquiryResource extends Resource
             ])
             ->bulkActions([
                 Tables\Actions\BulkActionGroup::make([
-                    // ✅ Bulk delete
+                    // Bulk delete
                     Tables\Actions\DeleteBulkAction::make()
                         ->label('Delete selected')
                         ->requiresConfirmation(),
