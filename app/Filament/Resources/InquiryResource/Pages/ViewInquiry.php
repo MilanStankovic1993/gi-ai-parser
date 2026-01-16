@@ -33,10 +33,8 @@ use Filament\Notifications\Notification;
 use Filament\Resources\Pages\ViewRecord;
 use Filament\Support\Enums\MaxWidth;
 use Illuminate\Support\Arr;
-use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Mail;
-use Illuminate\Support\Facades\Schema;
-use Throwable;
 
 class ViewInquiry extends ViewRecord
 {
@@ -104,28 +102,39 @@ class ViewInquiry extends ViewRecord
     }
 
     /**
-     * SAFE schema introspection:
-     * - Na nekim MySQL/MariaDB verzijama Laravel introspekcija puca (generation_expression u information_schema)
-     * - Umesto 500, vraćamo false i nastavljamo sa fallback kolonom.
+     * MariaDB-safe provera kolone preko information_schema (bez generation_expression).
+     * Cache-ujemo rezultat u okviru request-a.
      */
-    private function safeHasColumn(string $connection, string $table, string $column): bool
+    private function grckaHasColumn(string $table, string $column): bool
     {
-        try {
-            return Schema::connection($connection)->hasColumn($table, $column);
-        } catch (Throwable $e) {
-            Log::warning('safeHasColumn failed', [
-                'connection' => $connection,
-                'table'      => $table,
-                'column'     => $column,
-                'error'      => $e->getMessage(),
-            ]);
+        static $cache = [];
 
-            return false;
+        $key = $table . '.' . $column;
+        if (array_key_exists($key, $cache)) {
+            return (bool) $cache[$key];
+        }
+
+        try {
+            $row = DB::connection('grcka')->selectOne(
+                "select 1 as ok
+                 from information_schema.columns
+                 where table_schema = database()
+                   and table_name = ?
+                   and column_name = ?
+                 limit 1",
+                [$table, $column]
+            );
+
+            return $cache[$key] = $row !== null;
+        } catch (\Throwable $e) {
+            // Ako i ovo nekad pukne, samo vrati false (da ne obori UI).
+            return $cache[$key] = false;
         }
     }
 
     /**
      * Robust mapping: koja je "naziv" kolona u pt_regions?
+     * (NE koristi Schema::hasColumn zbog MariaDB generation_expression problema)
      */
     private function regionLabelColumn(): string
     {
@@ -135,17 +144,18 @@ class ViewInquiry extends ViewRecord
         $candidates = ['region', 'title', 'name', 'region_name', 'region_title'];
 
         foreach ($candidates as $c) {
-            if ($this->safeHasColumn('grcka', 'pt_regions', $c)) {
+            if ($this->grckaHasColumn('pt_regions', $c)) {
                 return $col = $c;
             }
         }
 
-        // fallback (ne idealno, ali sprečava crash)
+        // fallback (sprečava crash)
         return $col = 'region_id';
     }
 
     /**
-     * ✅ Robust mapping: koja je "naziv" kolona u pt_locations?
+     * Robust mapping: koja je "naziv" kolona u pt_locations?
+     * (NE koristi Schema::hasColumn zbog MariaDB generation_expression problema)
      */
     private function locationLabelColumn(): string
     {
@@ -155,7 +165,7 @@ class ViewInquiry extends ViewRecord
         $candidates = ['location', 'title', 'name', 'location_name', 'location_title'];
 
         foreach ($candidates as $c) {
-            if ($this->safeHasColumn('grcka', 'pt_locations', $c)) {
+            if ($this->grckaHasColumn('pt_locations', $c)) {
                 return $col = $c;
             }
         }
@@ -199,7 +209,7 @@ class ViewInquiry extends ViewRecord
     /**
      * Helper: pokušaj da iz teksta (Inquiry.region) pogodi region_id
      * - prvo exact, pa like fallback
-     * ✅ koristi realnu kolonu imena (auto-detect)
+     * koristi realnu kolonu imena (auto-detect)
      */
     private function guessRegionIdFromText(?string $text): ?int
     {
@@ -220,7 +230,7 @@ class ViewInquiry extends ViewRecord
      * Helper: pokušaj da iz teksta (Inquiry.location) pogodi location.id (po nazivu),
      * opcionalno suzi na region_id.
      * - prvo exact, pa like fallback
-     * ✅ koristi realnu kolonu imena (auto-detect)
+     * koristi realnu kolonu imena (auto-detect)
      */
     private function guessLocationIdFromText(?string $text, ?int $regionId = null): ?int
     {
@@ -471,7 +481,7 @@ class ViewInquiry extends ViewRecord
                                                 $qq->matchRegion($regionName);
                                             }
                                         })
-                                        // ✅ samo realne kolone
+                                        // samo realne kolone
                                         ->where(function ($qq) use ($search) {
                                             $qq->where('hotel_title', 'like', "%{$search}%")
                                                 ->orWhere('custom_name', 'like', "%{$search}%")
@@ -499,7 +509,7 @@ class ViewInquiry extends ViewRecord
                                     return (string) ($h->hotel_title ?: $h->custom_name ?: $h->api_name ?: ('Hotel #' . $h->hotel_id));
                                 }),
 
-                            // ✅ tekst polja su fallback, ali disable-ovana kad postoji izbor iz baze (da ne dođe do konflikta)
+                            // tekst polja su fallback, ali disable-ovana kad postoji izbor iz baze (da ne dođe do konflikta)
                             TextInput::make('region')
                                 ->label('Regija (tekst)')
                                 ->maxLength(255)
