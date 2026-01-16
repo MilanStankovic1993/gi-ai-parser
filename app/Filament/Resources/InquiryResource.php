@@ -24,7 +24,7 @@ class InquiryResource extends Resource
             \Filament\Forms\Components\Section::make('Guest')
                 ->schema([
                     \Filament\Forms\Components\TextInput::make('guest_name')
-                        ->label('Ime gosta')
+                        ->label('Gost')
                         ->maxLength(255),
 
                     \Filament\Forms\Components\TextInput::make('guest_email')
@@ -82,7 +82,7 @@ class InquiryResource extends Resource
                         ->numeric()
                         ->minValue(0),
 
-                    // SOURCE OF TRUTH: InquiryMissingData::normalizeChildrenAges (NE unique, 1-17)
+                    // SOURCE OF TRUTH: InquiryMissingData::normalizeChildrenAges
                     \Filament\Forms\Components\TextInput::make('children_ages')
                         ->label('Uzrast dece (npr: 5 ili 5, 8)')
                         ->maxLength(255)
@@ -146,8 +146,12 @@ class InquiryResource extends Resource
     public static function table(Table $table): Table
     {
         return $table
+            ->defaultSort('received_at', 'desc')
+            ->modifyQueryUsing(fn ($query) => $query->orderByDesc('received_at')->orderByDesc('id'))
             ->columns([
-                Tables\Columns\TextColumn::make('id')->label('ID')->sortable(),
+                Tables\Columns\TextColumn::make('id')
+                    ->label('ID')
+                    ->sortable(),
 
                 Tables\Columns\TextColumn::make('received_at')
                     ->label('Primljeno')
@@ -163,6 +167,8 @@ class InquiryResource extends Resource
                         }
                         return $record->guest_name ?: 'N/A';
                     })
+                    ->wrap()
+                    ->extraAttributes(['class' => 'max-w-[260px]'])
                     ->searchable(query: function ($query, string $search) {
                         $query->where(function ($q) use ($search) {
                             $q->where('guest_name', 'like', "%{$search}%")
@@ -170,11 +176,14 @@ class InquiryResource extends Resource
                         });
                     }),
 
-                Tables\Columns\TextColumn::make('subject')
+                Tables\Columns\ViewColumn::make('subject')
                     ->label('Upit')
-                    ->limit(60)
-                    ->tooltip(fn (Inquiry $record) => $record->raw_message ?: $record->subject)
-                    ->searchable(),
+                    ->view('filament.tables.columns.inquiry-subject')
+                    ->searchable()
+                    ->sortable(query: function ($query, string $direction) {
+                        // Sortiraj po subject (ili ako hoćeš po received_at, skloni sortable)
+                        return $query->orderBy('subject', $direction);
+                    }),
 
                 Tables\Columns\TextColumn::make('region')
                     ->label('Regija')

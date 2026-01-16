@@ -226,7 +226,7 @@ class ViewInquiry extends ViewRecord
 
         return [
             Actions\Action::make('send_reply')
-                ->label('Send')
+                ->label('Edit & Send')
                 ->icon('heroicon-o-paper-airplane')
                 ->color('success')
                 ->visible(fn () =>
