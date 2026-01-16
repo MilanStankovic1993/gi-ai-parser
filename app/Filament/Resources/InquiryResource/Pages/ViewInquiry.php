@@ -33,8 +33,10 @@ use Filament\Notifications\Notification;
 use Filament\Resources\Pages\ViewRecord;
 use Filament\Support\Enums\MaxWidth;
 use Illuminate\Support\Arr;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Mail;
 use Illuminate\Support\Facades\Schema;
+use Throwable;
 
 class ViewInquiry extends ViewRecord
 {
@@ -102,7 +104,28 @@ class ViewInquiry extends ViewRecord
     }
 
     /**
-     * ✅ Robust mapping: koja je "naziv" kolona u pt_regions?
+     * SAFE schema introspection:
+     * - Na nekim MySQL/MariaDB verzijama Laravel introspekcija puca (generation_expression u information_schema)
+     * - Umesto 500, vraćamo false i nastavljamo sa fallback kolonom.
+     */
+    private function safeHasColumn(string $connection, string $table, string $column): bool
+    {
+        try {
+            return Schema::connection($connection)->hasColumn($table, $column);
+        } catch (Throwable $e) {
+            Log::warning('safeHasColumn failed', [
+                'connection' => $connection,
+                'table'      => $table,
+                'column'     => $column,
+                'error'      => $e->getMessage(),
+            ]);
+
+            return false;
+        }
+    }
+
+    /**
+     * Robust mapping: koja je "naziv" kolona u pt_regions?
      */
     private function regionLabelColumn(): string
     {
@@ -112,7 +135,7 @@ class ViewInquiry extends ViewRecord
         $candidates = ['region', 'title', 'name', 'region_name', 'region_title'];
 
         foreach ($candidates as $c) {
-            if (Schema::connection('grcka')->hasColumn('pt_regions', $c)) {
+            if ($this->safeHasColumn('grcka', 'pt_regions', $c)) {
                 return $col = $c;
             }
         }
@@ -132,7 +155,7 @@ class ViewInquiry extends ViewRecord
         $candidates = ['location', 'title', 'name', 'location_name', 'location_title'];
 
         foreach ($candidates as $c) {
-            if (Schema::connection('grcka')->hasColumn('pt_locations', $c)) {
+            if ($this->safeHasColumn('grcka', 'pt_locations', $c)) {
                 return $col = $c;
             }
         }
